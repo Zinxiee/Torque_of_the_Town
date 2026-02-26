@@ -11,7 +11,7 @@ const char* password = "TorqueOfTheTown";
 // ==========================================
 // 2. BLOB DETECTION SETTINGS
 // ==========================================
-const int WHITE_THRESHOLD = 195; 
+const int WHITE_THRESHOLD = 200; 
 const int MIN_PIXELS = 50;
 
 // toggle debug mode to see binary mask (black and white thresholding)
@@ -231,5 +231,49 @@ void setup() {
 }
 
 void loop() {
-  delay(10000); 
+camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    delay(100);
+    return;
+  }
+
+  long sum_x = 0;
+  long sum_y = 0;
+  int white_pixel_count = 0;
+
+  // 1. CROPPED MATH
+  for (int y = CROP_Y_MIN; y < CROP_Y_MAX; y++) {
+    for (int x = CROP_X_MIN; x < CROP_X_MAX; x++) {
+      int index = (y * fb->width) + x;
+      uint8_t brightness = fb->buf[index];
+
+      if (brightness > WHITE_THRESHOLD) {
+        sum_x += x;
+        sum_y += y;
+        white_pixel_count++;
+      }
+    }
+  }
+
+  // 2. CALCULATE & SEND COORDINATES
+  if (white_pixel_count > MIN_PIXELS) {
+    int cx = sum_x / white_pixel_count;
+    int cy = sum_y / white_pixel_count;
+
+  // --- 3. CONTINUOUS STREAMING OVER WIRES ---
+  // This prints constantly, effectively tracking the disc in real-time
+    Serial1.printf("X:%d,Y:%d\n", cx, cy);
+    Serial.printf("Disc at X:%d, Y:%d\n", cx, cy);
+    
+  } else {
+    Serial1.println("NONE");
+  }
+
+  // 3. FREE MEMORY INSTANTLY
+  esp_camera_fb_return(fb);
+
+  // Short delay to prevent overwhelming the Main ESP32's Serial buffer
+  delay(100);
+  // delay(10000); 
 }
