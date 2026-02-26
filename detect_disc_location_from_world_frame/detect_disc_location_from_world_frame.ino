@@ -26,7 +26,7 @@ void setup() {
   Serial.begin(115200); 
   
   // Start the connection to the Camera (Make sure Camera D6 is wired to this ESP32's Pin 16)
-  CameraSerial.begin(9600, SERIAL_8N1, 16, 17); 
+  CameraSerial.begin(9600, SERIAL_8N1, 17, 18); 
   
   Serial.println("Robot Brain Online. Waiting for Camera Data...");
 }
