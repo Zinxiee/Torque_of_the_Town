@@ -9,10 +9,10 @@ A4 = [-236.0, 82.0] # TL Corner 4 World
 
 # 2. ENTER YOUR CAMERA COORDINATES HERE (Pixels)
 # Format: [X, Y]
-B1 = [54.0, 77.0]   # BL Corner 1 Pixels
-B2 = [226.0, 73.0]  # BR Corner 2 Pixels
-B3 = [225.0, 235.0] # TR Corner 3 Pixels
-B4 = [57.0, 228.0]  # TL Corner 4 Pixels
+B1 = [22.0, 64.0]   # BL Corner 1 Pixels
+B2 = [222.0, 61.0]  # BR Corner 2 Pixels
+B3 = [221.0, 250.0] # TR Corner 3 Pixels
+B4 = [20.0, 249.0]  # TL Corner 4 Pixels
 
 # --- THE MATH (Do not change) ---
 A = np.array([
