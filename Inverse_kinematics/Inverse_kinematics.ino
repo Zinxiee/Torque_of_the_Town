@@ -24,9 +24,9 @@ AccelStepper stepper2(AccelStepper::DRIVER, STEP_PIN_2, DIR_PIN_2);
 const float L1 = 110.0; // Length from Shoulder to Elbow
 const float L2 = 130.0; // Length from Elbow to end-effector
 
-// USER INPUT REQUIRED: Calculate your steps per degree #TODO
-const float STEPS_PER_REV = 200.0; // Standard NEMA 17
-const float MICROSTEPS = 16.0;     // Your driver's microstepping setting
+// USER INPUT REQUIRED: Calculate your steps per degree
+const float STEPS_PER_REV = 360.0 / 1.8; // Standard NEMA 17 (360 / angle per step)
+const float MICROSTEPS = 800.0 / STEPS_PER_REV;     // Your driver's microstepping setting (Pulse per rev / STEPS_PER_REV)
 const float GEAR_RATIO_1 = 32.0;   // Apiro gearbox ratio for Joint 1
 const float GEAR_RATIO_2 = 32.0;   // Apiro gearbox ratio for Joint 2
 
