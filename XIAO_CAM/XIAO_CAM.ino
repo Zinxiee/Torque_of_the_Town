@@ -9,22 +9,26 @@ const char* ssid = "RobotVision";
 const char* password = "TorqueOfTheTown";
 
 // ==========================================
-// 2. BLOB DETECTION SETTINGS
+// 2. BLOB DETECTION & AXIS CALIBRATION
 // ==========================================
-const int WHITE_THRESHOLD = 200; 
+const int WHITE_THRESHOLD = 250; 
 const int MIN_PIXELS = 50;
 
-// toggle debug mode to see binary mask (black and white thresholding)
+// Debug mode to see binary mask (black and white thresholding)
 const bool DEBUG_MASK_MODE = false;
+
+// --- AXIS TRANSFORMATION TOGGLES ---
+const bool SWAP_XY_AXES = true;       // True: X becomes Y, Y becomes X
+const bool INVERT_X_DIRECTION = true; // True: Flips the X scale backwards
+const bool INVERT_Y_DIRECTION = true; // True: Flips the Y scale backwards
 
 // ==========================================
 // 3. CROP BOX (REGION OF INTEREST)
 // ==========================================
-// Adjust these to cut out the robot/background. 
 // Max Width is 320, Max Height is 240.
 const int CROP_X_MIN = 40;  // Ignore the left 40 pixels
 const int CROP_X_MAX = 280; // Ignore the right 40 pixels
-const int CROP_Y_MIN = 20;  // Ignore the top 20 pixels
+const int CROP_Y_MIN = 5;   // Ignore the top 5 pixels
 const int CROP_Y_MAX = 240; // Ignore the bottom 0 pixels
 
 // ==========================================
@@ -54,6 +58,9 @@ static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 
 httpd_handle_t stream_httpd = NULL;
 
+// ==========================================
+// WEB SERVER HANDLER (Runs when browser is open)
+// ==========================================
 static esp_err_t stream_handler(httpd_req_t *req) {
   camera_fb_t * fb = NULL;
   esp_err_t res = ESP_OK;
@@ -64,7 +71,6 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
   if(res != ESP_OK) return res;
 
-  // THIS LOOP RUNS CONTINUOUSLY (Continuous Tracking of disc)
   while(true){
     fb = esp_camera_fb_get();
     if (!fb) {
@@ -73,13 +79,11 @@ static esp_err_t stream_handler(httpd_req_t *req) {
       break;
     }
 
-    // finding centroid
     long sum_x = 0;
     long sum_y = 0;
     int white_pixel_count = 0;
 
-    // --- 1. CENTROID MATH (within boundry box) ---
-    // Instead of starting at 0, we start at CROP_MIN.
+    // --- 1. CENTROID MATH ---
     for (int y = CROP_Y_MIN; y < CROP_Y_MAX; y++) {
       for (int x = CROP_X_MIN; x < CROP_X_MAX; x++) {
         int index = (y * fb->width) + x;
@@ -90,45 +94,59 @@ static esp_err_t stream_handler(httpd_req_t *req) {
           sum_y += y;
           white_pixel_count++;
 
-        // when debug mode is toggled:
-        if (DEBUG_MASK_MODE) {
-            fb->buf[index] = 255; // Force the pixel to Pure White on the stream
+          if (DEBUG_MASK_MODE) {
+            fb->buf[index] = 255; 
           }
         } else {
           if (DEBUG_MASK_MODE) {
-            fb->buf[index] = 0; // Force the pixel to Pure Black on the stream
+            fb->buf[index] = 0; 
           }
         }
       }
     }
 
-    // --- DRAW THE CROP BOX ON THE STREAM (For visuals) ---
-    // Top and Bottom lines
+    // --- DRAW THE CROP BOX ---
     for(int i = CROP_X_MIN; i < CROP_X_MAX; i++) {
-        fb->buf[CROP_Y_MIN * fb->width + i] = 100; // Gray line
+        fb->buf[CROP_Y_MIN * fb->width + i] = 100; 
         fb->buf[(CROP_Y_MAX-1) * fb->width + i] = 100;
     }
-    // Left and Right lines
     for(int i = CROP_Y_MIN; i < CROP_Y_MAX; i++) {
         fb->buf[i * fb->width + CROP_X_MIN] = 100;
         fb->buf[i * fb->width + (CROP_X_MAX-1)] = 100;
     }
 
-    // --- 2. DRAW CROSSHAIR ---
+    // --- 2. CALCULATE OUTPUT & DRAW CROSSHAIR ---
     if (white_pixel_count > MIN_PIXELS) {
-      int cy = sum_x / white_pixel_count;
-      int cx = sum_y / white_pixel_count;
+      int cx = sum_x / white_pixel_count;
+      int cy = sum_y / white_pixel_count;
       
       // Draw crosshair at the RAW optical location
       for(int i=-10; i<=10; i++){
-        if(cy+i>=0 && cy+i<fb->width) fb->buf[cx*fb->width + (cy+i)] = 0; 
-        if(cx+i>=0 && cx+i<fb->height) fb->buf[(cx+i)*fb->width + cy] = 0; 
+        if(cx+i>=0 && cx+i<fb->width) fb->buf[cy*fb->width + (cx+i)] = 0; 
+        if(cy+i>=0 && cy+i<fb->height) fb->buf[(cy+i)*fb->width + cx] = 0; 
       }
 
-      // --- 3. CONTINUOUS STREAMING OVER WIRES ---
-      // This prints constantly, effectively tracking the disc in real-time
-      Serial1.printf("X:%d,Y:%d\n", cx, cy);
-      Serial.printf("Disc at X:%d, Y:%d\n", cx, cy);
+      // --- AXIS TRANSFORMATION MATH ---
+      int final_x = cx;
+      int final_y = cy;
+
+      if (SWAP_XY_AXES) {
+        final_x = cy;
+        final_y = cx;
+      }
+
+      if (INVERT_X_DIRECTION) {
+        int max_x = SWAP_XY_AXES ? fb->height : fb->width;
+        final_x = (max_x - 1) - final_x;
+      }
+      if (INVERT_Y_DIRECTION) {
+        int max_y = SWAP_XY_AXES ? fb->width : fb->height;
+        final_y = (max_y - 1) - final_y;
+      }
+
+      // Send Coordinates
+      Serial1.printf("X:%d,Y:%d\n", final_x, final_y);
+      Serial.printf("[Stream] Raw: %d,%d | Output -> X:%d, Y:%d\n", cx, cy, final_x, final_y);
       
     } else {
       Serial1.println("NONE");
@@ -139,9 +157,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     esp_camera_fb_return(fb); 
     fb = NULL;
 
-    if(!jpeg_converted){
-      res = ESP_FAIL;
-    }
+    if(!jpeg_converted){ res = ESP_FAIL; }
 
     if(res == ESP_OK){
       size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
@@ -150,10 +166,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
       res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
     }
     
-    if(_jpg_buf){
-      free(_jpg_buf);
-      _jpg_buf = NULL;
-    } 
+    if(_jpg_buf){ free(_jpg_buf); _jpg_buf = NULL; } 
     if(res != ESP_OK) break;
   }
   return res;
@@ -175,26 +188,21 @@ void startCameraServer(){
   }
 }
 
+// ==========================================
+// SETUP
+// ==========================================
 void setup() {
   Serial.begin(115200);
   
   // Start UART connection to Main ESP32 (D7=RX, D6=TX)
   Serial1.begin(9600, SERIAL_8N1, D7, D6);
 
-  // disable this otherwise camera halts and waits for serial monitor:
-  // while(!Serial); // DEBUG ONLY
-
   camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM; config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
+  config.ledc_channel = LEDC_CHANNEL_0; config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM; config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM; config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM; config.pin_pclk = PCLK_GPIO_NUM; config.pin_vsync = VSYNC_GPIO_NUM; config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM; config.pin_pwdn = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   
   config.pixel_format = PIXFORMAT_GRAYSCALE; 
@@ -209,7 +217,7 @@ void setup() {
     return;
   }
 
-  // software flipping of camera
+  // Software flipping of camera hardware
   sensor_t * s = esp_camera_sensor_get();
   s->set_vflip(s, 1);
   s->set_hmirror(s, 0);
@@ -221,17 +229,18 @@ void setup() {
 
   Serial.println("=========================================");
   Serial.println("HEYO CAMERA IS OPERATIONAL, TRACKING IS LIVE");
-  Serial.print("Network Created! Connect to: ");
-  Serial.println(ssid);
-  Serial.print("Stream Video at: http://");
-  Serial.println(IP);
-  Serial.println("Coordinates are streaming to the esp32!");
+  Serial.print("Network Created! Connect to: "); Serial.println(ssid);
+  Serial.print("Stream Video at: http://"); Serial.println(IP);
+  Serial.println("Coordinates are streaming to the ESP32!");
   Serial.println("Note: X-axis is perpendicular to the short edge of the MDF");
   Serial.println("=========================================");
 }
 
+// ==========================================
+// AUTONOMOUS LOOP (Runs when browser is closed)
+// ==========================================
 void loop() {
-camera_fb_t * fb = esp_camera_fb_get();
+  camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed");
     delay(100);
@@ -261,10 +270,27 @@ camera_fb_t * fb = esp_camera_fb_get();
     int cx = sum_x / white_pixel_count;
     int cy = sum_y / white_pixel_count;
 
-  // --- 3. CONTINUOUS STREAMING OVER WIRES ---
-  // This prints constantly, effectively tracking the disc in real-time
-    Serial1.printf("X:%d,Y:%d\n", cx, cy);
-    Serial.printf("Disc at X:%d, Y:%d\n", cx, cy);
+    // --- AXIS TRANSFORMATION MATH ---
+    int final_x = cx;
+    int final_y = cy;
+
+    if (SWAP_XY_AXES) {
+      final_x = cy;
+      final_y = cx;
+    }
+
+    if (INVERT_X_DIRECTION) {
+      int max_x = SWAP_XY_AXES ? fb->height : fb->width;
+      final_x = (max_x - 1) - final_x;
+    }
+    if (INVERT_Y_DIRECTION) {
+      int max_y = SWAP_XY_AXES ? fb->width : fb->height;
+      final_y = (max_y - 1) - final_y;
+    }
+
+    // Send Coordinates
+    Serial1.printf("X:%d,Y:%d\n", final_x, final_y);
+    Serial.printf("[Auto] Raw: %d,%d | Output -> X:%d, Y:%d\n", cx, cy, final_x, final_y);
     
   } else {
     Serial1.println("NONE");
@@ -273,7 +299,6 @@ camera_fb_t * fb = esp_camera_fb_get();
   // 3. FREE MEMORY INSTANTLY
   esp_camera_fb_return(fb);
 
-  // Short delay to prevent overwhelming the Main ESP32's Serial buffer
-  delay(100);
-  // delay(10000); 
+  // Delay prevents overwhelming the Main ESP32's Serial buffer
+  delay(100); 
 }
