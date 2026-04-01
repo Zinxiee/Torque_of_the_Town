@@ -20,9 +20,9 @@
 
 #define MOTOR_INTERFACE_TYPE 1
 
-AccelStepper stepper1(MOTOR_INTERFACE_TYPE, M1_STEP_PIN, M1_DIR_PIN);
-AccelStepper stepper2(MOTOR_INTERFACE_TYPE, M2_STEP_PIN, M2_DIR_PIN);
-AccelStepper stepper3(MOTOR_INTERFACE_TYPE, M3_STEP_PIN, M3_DIR_PIN);
+AccelStepper stepper1(MOTOR_INTERFACE_TYPE, M1_STEP_PIN, M1_DIR_PIN); // prismatic
+AccelStepper stepper2(MOTOR_INTERFACE_TYPE, M2_STEP_PIN, M2_DIR_PIN); // rotary 1
+AccelStepper stepper3(MOTOR_INTERFACE_TYPE, M3_STEP_PIN, M3_DIR_PIN); // rotary 2
 
 // ==========================================
 // 2. ROBOT GEOMETRY & CONSTANTS
@@ -76,19 +76,22 @@ void setup() {
   Serial.println("Motors configured. Starting homing sequence...");
   homeRobot();
   
-  Serial.println("Homing Complete. Beginning Trace in 3 seconds...");
-  delay(1000); 
+Serial.println("Homing Complete. Moving to Bottom Right in 2 seconds...");
+  delay(2000); 
   
-  isTracing = true;
-  // moveToPos(pickupZone[0][0], pickupZone[0][1]);
-  // delay(2000);
+  // Move to Bottom Right (Point 2)
   moveToPos(pickupZone[1][0], pickupZone[1][1]);
-  println(pickupZone[1][0]);
-  println(pickupZone[1][1]);
+  runToTarget(); // Force the ESP32 to finish the move before continuing
+  
+  Serial.println("Reached Bottom Right! Waiting 2 seconds...");
   delay(2000);
-  // moveToPos(pickupZone[2][0], pickupZone[2][1]);
-  // delay(2000);
+
+  // Move to Top Left (Point 4)
+  Serial.println("Moving to Top Left...");
   moveToPos(pickupZone[3][0], pickupZone[3][1]);
+  runToTarget(); // Force the ESP32 to finish the move
+  
+  Serial.println("Trace Complete!");
 }
 
 void loop() {
@@ -116,6 +119,17 @@ void loop() {
 }
 
 // ==========================================
+// BLOCKING MOVE (till locations are reached)
+// ==========================================
+void runToTarget() {
+  // This traps the code here, rapidly stepping the motors until both reach 0 distance to go
+  while (stepper2.distanceToGo() != 0 || stepper3.distanceToGo() != 0) {
+    stepper2.run();
+    stepper3.run();
+  }
+}
+
+// ==========================================
 // 4. INVERSE KINEMATICS FUNCTION
 // ==========================================
 void moveToPos(float x, float y) {
@@ -127,8 +141,8 @@ void moveToPos(float x, float y) {
     return; 
   }
 
-  // Calculate angles in radians
-  float theta2_rad = acos(cos_theta2);
+  // Calculate angles in radians (Controls right or left elbow)
+  float theta2_rad = acos(cos_theta2); // acos always returns positive and so defaults to right elbow
   float theta1_rad = atan2(y, x) - atan2(L2 * sin(theta2_rad), L1 + L2 * cos(theta2_rad));
 
   // Convert radians to degrees
@@ -160,7 +174,7 @@ void homeRobot() {
   //   stepper3.runSpeed();
   // }
   // stepper3.stop();
-  stepper3.setCurrentPosition(THETA2_HOME_DEG * STEPS_PER_DEG);
+  stepper3.setCurrentPosition(-THETA2_HOME_DEG * STEPS_PER_DEG); // negative because it is physically +ve clockwise but math assumes +ve CCW
 
   // Home Shoulder (stepper2)
   // stepper2.setSpeed(-300); // Adjust sign if it spins the wrong way
