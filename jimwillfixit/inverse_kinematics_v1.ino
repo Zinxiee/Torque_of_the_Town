@@ -32,7 +32,7 @@ const float L2 = 130.0; // Length from Elbow to end-effector
 const float THETA1_HOME_DEG = 290;  // Angle of shoulder when hitting limit
 const float THETA2_HOME_DEG = -60;   // Angle of elbow when hitting limit
 
-// Motor scaling (Assuming 1.8deg motor, 4x microstepping (800 pulse/rev), 32:1 gear ratio)
+// Motor scaling (Assuming 1.8deg motor, 8x microstepping (1600 pulse/rev), 4:1 gear ratio)
 const float STEPS_PER_DEG = (200.0 * 8.0 * 4.0) / 360.0; // TODO: Should this not just be 1600/360 (1600 steps per 1.8 deg / 360 deg)
 
 // ==========================================
