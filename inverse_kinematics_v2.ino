@@ -116,7 +116,7 @@ void loop() {
       moveToPos(-148, 0);
     }
     if (cmd == '6') {
-      Serial.print("Moving to centre point: ");
+      Serial.print("Moving to lift up point: ");
       moveToPos(-148, 190);
     }
   }
