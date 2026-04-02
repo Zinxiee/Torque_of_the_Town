@@ -1,0 +1,445 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_http_server.h"
+#include <math.h>
+
+// ==========================================
+// 1. WIFI NETWORK
+// ==========================================
+const char* ssid = "RobotVision";
+const char* password = "TorqueOfTheTown";
+
+// ==========================================
+// 2. DISC DETECTION PARAMETERS
+// ==========================================
+// Since background is black and disc is white, we still use brightness thresholding.
+// But we now isolate blobs and score them by circularity.
+
+const int WHITE_THRESHOLD = 210;   // Try 200-230 depending on lighting
+const int MIN_BLOB_AREA   = 80;    // Minimum valid blob size
+const int MAX_BLOB_AREA   = 12000; // Maximum valid blob size
+
+// Shape filters
+const float MIN_CIRCULARITY = 0.60f;  // Perfect circle ~= 1.0
+const float MAX_ASPECT_ERROR = 0.35f; // width/height should stay near 1
+const float MIN_FILL_RATIO = 0.45f;   // blob area / bounding-box area
+
+// Debug mode to see threshold mask
+const bool DEBUG_MASK_MODE = false;
+
+// --- AXIS TRANSFORMATION TOGGLES ---
+const bool SWAP_XY_AXES = true;
+const bool INVERT_X_DIRECTION = true;
+const bool INVERT_Y_DIRECTION = true;
+
+// ==========================================
+// 3. CROP BOX (REGION OF INTEREST)
+// ==========================================
+// Max Width is 320, Max Height is 240.
+const int CROP_X_MIN = 40;
+const int CROP_X_MAX = 280;
+const int CROP_Y_MIN = 5;
+const int CROP_Y_MAX = 240;
+
+// ==========================================
+// PINOUT
+// ==========================================
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     10
+#define SIOD_GPIO_NUM     40
+#define SIOC_GPIO_NUM     39
+#define Y9_GPIO_NUM       48
+#define Y8_GPIO_NUM       11
+#define Y7_GPIO_NUM       12
+#define Y6_GPIO_NUM       14
+#define Y5_GPIO_NUM       16
+#define Y4_GPIO_NUM       18
+#define Y3_GPIO_NUM       17
+#define Y2_GPIO_NUM       15
+#define VSYNC_GPIO_NUM    38
+#define HREF_GPIO_NUM     47
+#define PCLK_GPIO_NUM     13
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+httpd_handle_t stream_httpd = NULL;
+
+// ==========================================
+// DETECTION STRUCTS / BUFFERS
+// ==========================================
+struct DiscDetection {
+  bool found;
+  int cx;
+  int cy;
+  int area;
+  float circularity;
+  float aspect;
+  float fillRatio;
+};
+
+static uint8_t* roiMask = NULL;       // 0 = background, 1 = white pixel, 2 = visited
+static uint32_t* floodQueue = NULL;   // queue for flood-fill
+
+static inline int roiWidth()  { return CROP_X_MAX - CROP_X_MIN; }
+static inline int roiHeight() { return CROP_Y_MAX - CROP_Y_MIN; }
+static inline int roiSize()   { return roiWidth() * roiHeight(); }
+
+// ==========================================
+// HELPERS
+// ==========================================
+void drawCropBox(camera_fb_t* fb) {
+  for (int x = CROP_X_MIN; x < CROP_X_MAX; x++) {
+    fb->buf[CROP_Y_MIN * fb->width + x] = 100;
+    fb->buf[(CROP_Y_MAX - 1) * fb->width + x] = 100;
+  }
+  for (int y = CROP_Y_MIN; y < CROP_Y_MAX; y++) {
+    fb->buf[y * fb->width + CROP_X_MIN] = 100;
+    fb->buf[y * fb->width + (CROP_X_MAX - 1)] = 100;
+  }
+}
+
+void drawCrosshair(camera_fb_t* fb, int cx, int cy) {
+  for (int i = -10; i <= 10; i++) {
+    if (cx + i >= 0 && cx + i < fb->width) {
+      fb->buf[cy * fb->width + (cx + i)] = 0;
+    }
+    if (cy + i >= 0 && cy + i < fb->height) {
+      fb->buf[(cy + i) * fb->width + cx] = 0;
+    }
+  }
+}
+
+void transformCoordinates(int rawX, int rawY, int frameW, int frameH, int& finalX, int& finalY) {
+  finalX = rawX;
+  finalY = rawY;
+
+  if (SWAP_XY_AXES) {
+    finalX = rawY;
+    finalY = rawX;
+  }
+
+  if (INVERT_X_DIRECTION) {
+    int maxX = SWAP_XY_AXES ? frameH : frameW;
+    finalX = (maxX - 1) - finalX;
+  }
+
+  if (INVERT_Y_DIRECTION) {
+    int maxY = SWAP_XY_AXES ? frameW : frameH;
+    finalY = (maxY - 1) - finalY;
+  }
+}
+
+// ==========================================
+// DISC DETECTION
+// ==========================================
+DiscDetection detectDisc(camera_fb_t* fb, bool drawDebug) {
+  DiscDetection best = { false, 0, 0, 0, 0.0f, 0.0f, 0.0f };
+
+  const int frameW = fb->width;
+  const int frameH = fb->height;
+  const int rw = roiWidth();
+  const int rh = roiHeight();
+
+  // 1) Build binary mask inside ROI
+  for (int y = CROP_Y_MIN; y < CROP_Y_MAX; y++) {
+    int frameRow = y * frameW;
+    int my = y - CROP_Y_MIN;
+    int maskRow = my * rw;
+
+    for (int x = CROP_X_MIN; x < CROP_X_MAX; x++) {
+      int mx = x - CROP_X_MIN;
+      int maskIdx = maskRow + mx;
+
+      uint8_t brightness = fb->buf[frameRow + x];
+      roiMask[maskIdx] = (brightness >= WHITE_THRESHOLD) ? 1 : 0;
+
+      if (drawDebug && DEBUG_MASK_MODE) {
+        fb->buf[frameRow + x] = roiMask[maskIdx] ? 255 : 0;
+      }
+    }
+  }
+
+  // 2) Find connected blobs and keep the best "disc-like" one
+  float bestScore = -99999.0f;
+
+  for (int my = 0; my < rh; my++) {
+    for (int mx = 0; mx < rw; mx++) {
+      int startIdx = my * rw + mx;
+      if (roiMask[startIdx] != 1) continue;
+
+      // Flood fill
+      int qHead = 0;
+      int qTail = 0;
+      floodQueue[qTail++] = startIdx;
+      roiMask[startIdx] = 2;
+
+      int area = 0;
+      long sumX = 0;
+      long sumY = 0;
+      int minX = mx, maxX = mx, minY = my, maxY = my;
+      int perimeter = 0;
+
+      while (qHead < qTail) {
+        int idx = floodQueue[qHead++];
+        int cy = idx / rw;
+        int cx = idx % rw;
+
+        area++;
+        sumX += cx;
+        sumY += cy;
+
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+
+        const int nx[4] = {-1, 1, 0, 0};
+        const int ny[4] = {0, 0, -1, 1};
+
+        for (int k = 0; k < 4; k++) {
+          int xx = cx + nx[k];
+          int yy = cy + ny[k];
+
+          if (xx < 0 || xx >= rw || yy < 0 || yy >= rh) {
+            perimeter++;
+            continue;
+          }
+
+          int nIdx = yy * rw + xx;
+
+          if (roiMask[nIdx] == 0) {
+            perimeter++;
+          } else if (roiMask[nIdx] == 1) {
+            roiMask[nIdx] = 2;
+            floodQueue[qTail++] = nIdx;
+          }
+        }
+      }
+
+      if (area < MIN_BLOB_AREA || area > MAX_BLOB_AREA || perimeter <= 0) {
+        continue;
+      }
+
+      int blobW = maxX - minX + 1;
+      int blobH = maxY - minY + 1;
+      int bboxArea = blobW * blobH;
+
+      float aspect = (blobH > 0) ? ((float)blobW / (float)blobH) : 999.0f;
+      float aspectError = fabsf(1.0f - aspect);
+      float fillRatio = (bboxArea > 0) ? ((float)area / (float)bboxArea) : 0.0f;
+      float circularity = (4.0f * 3.14159f * area) / ((float)perimeter * (float)perimeter);
+
+      bool shapeOK =
+        (aspectError <= MAX_ASPECT_ERROR) &&
+        (fillRatio >= MIN_FILL_RATIO) &&
+        (circularity >= MIN_CIRCULARITY);
+
+      if (!shapeOK) continue;
+
+      // Prefer blobs that are more circular and reasonably large
+      float score =
+        circularity * 1000.0f +
+        fillRatio * 200.0f -
+        aspectError * 300.0f +
+        area * 0.02f;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best.found = true;
+        best.cx = CROP_X_MIN + (sumX / area);
+        best.cy = CROP_Y_MIN + (sumY / area);
+        best.area = area;
+        best.circularity = circularity;
+        best.aspect = aspect;
+        best.fillRatio = fillRatio;
+      }
+    }
+  }
+
+  return best;
+}
+
+// ==========================================
+// COMMON SEND FUNCTION
+// ==========================================
+void reportDetection(const char* tag, camera_fb_t* fb, const DiscDetection& d) {
+  if (d.found) {
+    int final_x, final_y;
+    transformCoordinates(d.cx, d.cy, fb->width, fb->height, final_x, final_y);
+
+    Serial1.printf("X:%d,Y:%d\n", final_x, final_y);
+    Serial.printf("[%s] Raw:%d,%d | Output X:%d Y:%d | area:%d circ:%.2f fill:%.2f aspect:%.2f\n",
+                  tag, d.cx, d.cy, final_x, final_y,
+                  d.area, d.circularity, d.fillRatio, d.aspect);
+  } else {
+    Serial1.println("NONE");
+  }
+}
+
+// ==========================================
+// WEB SERVER HANDLER
+// ==========================================
+static esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  esp_err_t res = ESP_OK;
+  size_t _jpg_buf_len = 0;
+  uint8_t *_jpg_buf = NULL;
+  char part_buf[64];  // FIXED
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) return res;
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+      break;
+    }
+
+    DiscDetection d = detectDisc(fb, true);
+
+    drawCropBox(fb);
+    if (d.found) {
+      drawCrosshair(fb, d.cx, d.cy);
+    }
+
+    reportDetection("Stream", fb, d);
+
+    bool jpeg_converted = frame2jpg(fb, 20, &_jpg_buf, &_jpg_buf_len);
+    esp_camera_fb_return(fb);
+    fb = NULL;
+
+    if (!jpeg_converted) {
+      res = ESP_FAIL;
+    }
+
+    if (res == ESP_OK) {
+      size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, _jpg_buf_len);
+      res = httpd_resp_send_chunk(req, part_buf, hlen);
+      if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+      if (res == ESP_OK) res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    }
+
+    if (_jpg_buf) {
+      free(_jpg_buf);
+      _jpg_buf = NULL;
+    }
+
+    if (res != ESP_OK) break;
+  }
+
+  return res;
+}
+
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+
+  httpd_uri_t index_uri = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = stream_handler,
+    .user_ctx = NULL
+  };
+
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &index_uri);
+  }
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+
+  // Start UART connection to Main ESP32
+  Serial1.begin(9600, SERIAL_8N1, D7, D6);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.fb_count = 1;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed! 0x%x\n", err);
+    return;
+  }
+
+  roiMask = (uint8_t*) ps_malloc(roiSize());
+  floodQueue = (uint32_t*) ps_malloc(sizeof(uint32_t) * roiSize());
+
+  if (!roiMask || !floodQueue) {
+    Serial.println("Failed to allocate detection buffers");
+    return;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 0);
+
+  // Optional tuning
+  s->set_brightness(s, 0);
+  s->set_contrast(s, 1);
+  s->set_saturation(s, 0);
+
+  WiFi.softAP(ssid, password);
+  IPAddress IP = WiFi.softAPIP();
+  startCameraServer();
+
+  Serial.println("=========================================");
+  Serial.println("HEYO CAMERA IS OPERATIONAL, TRACKING IS LIVE");
+  Serial.print("Network Created! Connect to: ");
+  Serial.println(ssid);
+  Serial.print("Stream Video at: http://");
+  Serial.println(IP);
+  Serial.println("Coordinates are streaming to the ESP32!");
+  Serial.println("=========================================");
+}
+
+// ==========================================
+// AUTONOMOUS LOOP
+// ==========================================
+void loop() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    delay(100);
+    return;
+  }
+
+  DiscDetection d = detectDisc(fb, false);
+  reportDetection("Auto", fb, d);
+
+  esp_camera_fb_return(fb);
+
+  delay(60);
+}
