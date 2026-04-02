@@ -9,7 +9,7 @@
 // Motor 1 (Prismatic Z-Axis)
 #define M1_STEP_PIN 4
 #define M1_DIR_PIN  5
-#define LIMIT_PIN_2 10 // TODO THIS MUST BE CHANGED
+#define LIMIT_PIN_Z 10 // TODO THIS MUST BE CHANGED
 
 // Motor 2 (Shoulder - Rotary 1)
 #define M2_STEP_PIN 6
@@ -19,7 +19,7 @@
 #define M3_STEP_PIN 15
 #define M3_DIR_PIN  16
 
-#define LIMIT_PIN_3 11 // TODO THIS MUST BE CHANGED
+#define LIMIT_PIN_XY 11 // TODO THIS MUST BE CHANGED
 
 // Camera Serial connection
 HardwareSerial CameraSerial(2); 
@@ -28,14 +28,49 @@ HardwareSerial CameraSerial(2);
 Servo gripperServo;
 const int SERVO_PIN = 8; // TODO miht need to be changed
 
-bool locatingDisc = false; 
-bool deliveringDisc = false;
-
 #define MOTOR_INTERFACE_TYPE 1
 
 AccelStepper stepper1(MOTOR_INTERFACE_TYPE, M1_STEP_PIN, M1_DIR_PIN); // prismatic joint
 AccelStepper stepper2(MOTOR_INTERFACE_TYPE, M2_STEP_PIN, M2_DIR_PIN); // revolute joint shoulder
 AccelStepper stepper3(MOTOR_INTERFACE_TYPE, M3_STEP_PIN, M3_DIR_PIN); // revolute joint elbow
+
+// ==========================================
+//  STATE MACHINE
+// ==========================================
+// Every possible state the robot can be in. Only one state is active at a time.
+enum RobotState {
+  STATE_IDLE,
+  STATE_LOCATING_DISC,       // Waiting for camera to find a disc
+  STATE_MOVING_TO_DISC,      // Arm moving to disc XY position
+  STATE_PICKUP_DESCEND,      // Z-axis lowering down to disc
+  STATE_PICKUP_CLOSE,        // Gripper closing (instantaneous, but needs a small settle delay)
+  STATE_PICKUP_ASCEND,       // Z-axis raising back up with disc
+  STATE_DELIVER_MOVE_SAFE,   // Arm moving to a safe intermediate XY before travelling to dropoff
+  STATE_DELIVER_ASCEND,      // Z-axis lifting up to travel height at safe XY
+  STATE_DELIVER_MOVE_DROP,   // Arms moving to dropoff XY
+  STATE_DELIVER_DESCEND,     // Z-axis lowering at dropoff
+  STATE_DELIVER_OPEN,        // Gripper opening to release disc
+  STATE_RETURN_ASCEND,       // Z-axis lifting back up after release
+  STATE_RETURN_HOME,         // Arm returning to home/observation position
+};
+
+RobotState currentState = STATE_IDLE;
+
+// Timestamp used for non-blocking delays (e.g. gripper settle time)
+unsigned long stateTimer = 0;
+
+// ---- Calibration values (fill these in once tested) ----
+const long Z_DISC_LEVEL     =    0;
+const long Z_TRAVEL_HEIGHT  = 200;   // TODO: steps for Z safe travel height
+const long Z_DROPOFF_HEIGHT = 200;   // TODO: steps for Z at dropoff height
+const long Z_OBSERVE_HEIGHT =  500;   // TODO: steps for Z in observation position (~2cm from gnd)
+
+const float SAFE_XY_X = -148.0;      // Intermediate safe XY position before dropoff
+const float SAFE_XY_Y =  190.0;
+// float DROPOFF_X = ???;            // TODO: fill in flipping station dropoff XY
+// float DROPOFF_Y = ???;
+
+const unsigned long GRIPPER_SETTLE_MS = 300; // Time to wait after closing/opening gripper // TODO - test this
 
 // =======================================================
 //  CAMERA CALIBRATION PARAMETERS
@@ -68,19 +103,19 @@ const float STEPS_PER_DEG = (200.0 * 8.0 * 4.0) / 360.0;
 //  TARGET PICKUP ZONE
 // ==========================================
 const int NUM_CORNERS = 4;
-float pickupZone[NUM_CORNERS][2] = {
-  {-243.0, -82.0}, // Point 1: Bottom left
-  {-55.0, -86.0},  // Point 2: Bottom right
-  {-53.0, 82.0},   // Point 3: Top right
-  {-236.0, 82.0}   // Point 4: Top left
-};
+// float pickupZone[NUM_CORNERS][2] = {
+//   {-243.0, -82.0}, // Point 1: Bottom left
+//   {-55.0, -86.0},  // Point 2: Bottom right
+//   {-53.0, 82.0},   // Point 3: Top right
+//   {-236.0, 82.0}   // Point 4: Top left
+// };
 
 void setup() {
   Serial.begin(115200);
   Serial.println("Yippee! system starting...");
 
-  pinMode(LIMIT_PIN_2, INPUT_PULLUP);
-  pinMode(LIMIT_PIN_3, INPUT_PULLUP);
+  pinMode(LIMIT_PIN_Z, INPUT_PULLUP);
+  pinMode(LIMIT_PIN_XY, INPUT_PULLUP);
 
   // ESP32 potentially too fast for DM556 drivers, so this prevents skipping steps // TODO perhaps decrease
   stepper1.setMinPulseWidth(20);
@@ -111,6 +146,7 @@ void setup() {
   gripperServo.write(55); // TODO Start angle of 55 might need to be changed
 
   // Start connection to the Camera (RX, TX)
+  CameraSerial.setTimeout(20); 
   CameraSerial.begin(9600, SERIAL_8N1, 17, 18); // note slower serial for camera 
   Serial.println("Torquey is ...  A L I V E");
 
@@ -118,64 +154,178 @@ void setup() {
   homeRobot();
 }
 
-void loop() {
+void loop() { // no delays or while loops allowed!
   // These must run constantly to generate the steps
   stepper1.run();
   stepper2.run();
   stepper3.run();
 
-  if (locatingDisc) {
-    locateThenMoveToDisc();
+  // Route to the correct handler for whichever state we're in
+  switch (currentState) {
+  // PICK UP DISC PROCESS:
+  // -> move prismatic joint down to position 0
+  // -> close gripper
+  // -> move prismatic joint up to position X
+
+  // DELIVER DISC PROCESS: 
+  // -> EE moves to lift up position
+  // -> prismatic joint lifts up
+  // -> EE moves to dropoff location
+  // -> servo is opened and disc is dropped
+  // -> EE moves to lift up position
+  // -> prismatic joint drops down 
+
+    case STATE_IDLE:
+      // Do nothing. Transition triggered externally
+      break;
+
+    case STATE_LOCATING_DISC:
+      handleLocatingDisc();
+      break;
+
+    case STATE_MOVING_TO_DISC:
+      // Wait until BOTH arm joints have finished moving
+      if (motorsIdle(false, true, true)) {
+        // Queue the Z descent
+        stepper1.moveTo(Z_DISC_LEVEL);
+        transitionTo(STATE_PICKUP_DESCEND);
+      }
+      break;
+
+    case STATE_PICKUP_DESCEND:
+      // Wait for Z-axis to reach disc level
+      if (motorsIdle(true, false, false)) {
+        // Z is down — now close the gripper
+        closeGripper();
+        stateTimer = millis(); // Start settle timer
+        transitionTo(STATE_PICKUP_CLOSE);
+      }
+      break;
+
+    case STATE_PICKUP_CLOSE:
+      // Give the gripper time to physically close before moving
+      if (millis() - stateTimer >= GRIPPER_SETTLE_MS) {
+        stepper1.moveTo(Z_TRAVEL_HEIGHT);
+        transitionTo(STATE_PICKUP_ASCEND);
+      }
+      break;
+
+    case STATE_PICKUP_ASCEND:
+      if (motorsIdle(true, false, false)) {
+        // Safely up — move arms to safe XY before travelling to dropoff
+        moveToPos(SAFE_XY_X, SAFE_XY_Y);
+        transitionTo(STATE_DELIVER_MOVE_SAFE);
+      }
+      break;
+
+    case STATE_DELIVER_MOVE_SAFE:
+      if (motorsIdle(false, true, true)) {
+        transitionTo(STATE_DELIVER_MOVE_DROP);
+        // moveToPos(DROPOFF_X, DROPOFF_Y); // TODO: uncomment once coords known
+      }
+      break;
+
+    case STATE_DELIVER_MOVE_DROP:
+      if (motorsIdle(false, true, true)) {
+        stepper1.moveTo(Z_DROPOFF_HEIGHT);
+        transitionTo(STATE_DELIVER_DESCEND);
+      }
+      break;
+
+    case STATE_DELIVER_DESCEND:
+      if (motorsIdle(true, false, false)) {
+        openGripper();
+        stateTimer = millis();
+        transitionTo(STATE_DELIVER_OPEN);
+      }
+      break;
+
+    case STATE_DELIVER_OPEN:
+      if (millis() - stateTimer >= GRIPPER_SETTLE_MS) {
+        stepper1.moveTo(Z_TRAVEL_HEIGHT);
+        transitionTo(STATE_RETURN_ASCEND);
+      }
+      break;
+
+    case STATE_RETURN_ASCEND:
+      if (motorsIdle(true, false, false)) {
+        // Return arms to observation/home position
+        stepper2.moveTo(THETA1_HOME_DEG * STEPS_PER_DEG);
+        stepper3.moveTo(-THETA2_HOME_DEG * STEPS_PER_DEG);
+        transitionTo(STATE_RETURN_HOME);
+      }
+      break;
+
+    case STATE_RETURN_HOME:
+      if (motorsIdle(false, true, true)) {
+        // Lower Z to observation height, then start looking for the next disc
+        stepper1.moveTo(Z_OBSERVE_HEIGHT);
+        // We don't wait for Z here — camera can start scanning straight away
+        transitionTo(STATE_LOCATING_DISC);
+      }
+      break;
   }
-  if (deliveringDisc) {
-    pickUpDisc();
-    deliverDisc();
-  }
+}
+
+
+// ==========================================
+//  STATE MACHINE HELPERS
+// ==========================================
+
+// Call this whenever you want to move to a new state.
+// Keeping transitions in one place makes debugging much easier.
+void transitionTo(RobotState newState) {
+  Serial.print("State: ");
+  Serial.print(currentState);
+  Serial.print(" -> ");
+  Serial.println(newState);
+  currentState = newState;
+}
+
+// Returns true when the selected motors have finished moving.
+// Pass true for each motor axis you want to check.
+bool motorsIdle(bool checkZ, bool checkShoulder, bool checkElbow) {
+  if (checkZ       && stepper1.distanceToGo() != 0) return false;
+  if (checkShoulder && stepper2.distanceToGo() != 0) return false;
+  if (checkElbow   && stepper3.distanceToGo() != 0) return false;
+  return true;
 }
 
 
 // =======================================================
 //  CAMERA
 // =======================================================
-void locateThenMoveToDisc() {
-  // 1. Check if the camera has sent a new text string over the wire
-  if (CameraSerial.available()) {
+void handleLocatingDisc() {
+  if (!CameraSerial.available()) return; // TODO might be good to put a serial.print in this case
     
-    // Read the text until the end of the line
-    String incomingData = CameraSerial.readStringUntil('\n'); // readStringUntil will stutter (and lose steps to) motors but should be fine as they shouldn't be moving for detection
-    incomingData.trim(); // Clean up any hidden spaces or carriage returns
-    
-    // 2. Did the camera lose the disc?
-    if (incomingData == "NONE") {
-      // The disc isn't visible. Do nothing, or tell the robot to stop moving. 
-      return; 
-    }
+  // Read the text until the end of the line
+  String incomingData = CameraSerial.readStringUntil('\n'); // readStringUntil will stutter (and lose steps to) motors but should be fine as they shouldn't be moving for detection
+  incomingData.trim(); // Clean up any hidden spaces or carriage returns
+  
+  // Did the camera lose the disc?
+  if (incomingData == "NONE") {
+    // The disc isn't visible. Do nothing, or tell the robot to stop moving. 
+    return; 
+  }
 
-    // 3. Variables to hold our extracted numbers
-    int raw_pixel_x = 0;
-    int raw_pixel_y = 0;
-    
-    // 4. Extract the numbers from the string "X:150,Y:120"
-    if (sscanf(incomingData.c_str(), "X:%d,Y:%d", &raw_pixel_x, &raw_pixel_y) == 2) {
-      
-      // Variables to hold our final real-world coordinates
-      float target_mm_x = 0;
-      float target_mm_y = 0;
-      
-      // 5. RUN THE MATH ON THE FLY!
-      calculateDiscLocation((float)raw_pixel_x, (float)raw_pixel_y, target_mm_x, target_mm_y);
-      
-      // 6. Print results to verify
-      // Serial.printf("Camera sees Pixels -> X:%d, Y:%d | ", raw_pixel_x, raw_pixel_y);
-      Serial.printf("Potential Disc Located -> X: %.1f mm, Y: %.1f mm\n", target_mm_x, target_mm_y);
-      
-      // if values remain the same then this is the location we want
-      if (areValuesStable(target_mm_x, target_mm_y)) {
-        Serial.printf("Moving to Disc Location -> X: %.1f mm, Y: %.1f mm\n", target_mm_x, target_mm_y);
-        moveToPos(target_mm_x, target_mm_y);
-        locatingDisc = false;
-        deliveringDisc = true;
-      }
+  // Variables to hold our extracted numbers and final real-world coordinates
+  float target_mm_x = 0;
+  float target_mm_y = 0;
+  int raw_pixel_x = 0;
+  int raw_pixel_y = 0;
+  
+  // Extract the numbers from the string "X:150,Y:120"
+  if (sscanf(incomingData.c_str(), "X:%d,Y:%d", &raw_pixel_x, &raw_pixel_y) == 2) {
+    calculateDiscLocation((float)raw_pixel_x, (float)raw_pixel_y, target_mm_x, target_mm_y);
+
+    Serial.printf("Potential Disc Located -> X: %.1f mm, Y: %.1f mm\n", target_mm_x, target_mm_y);
+
+    if (areValuesStable(target_mm_x, target_mm_y)) {
+      Serial.printf("Moving to Disc Location -> X: %.1f mm, Y: %.1f mm\n", target_mm_x, target_mm_y);
+
+      // Move the arms, then immediately start the descent once they arrive
+      moveToPos(target_mm_x, target_mm_y);
+      transitionTo(STATE_MOVING_TO_DISC);
     }
   }
 }
@@ -187,25 +337,23 @@ void calculateDiscLocation(float pixel_x, float pixel_y, float &world_x, float &
   world_y = (p2 * pixel_x) + (p1 * pixel_y) + ty;
 }
 
-bool areValuesStable(int currentX, int currentY) { // there is a type mismatch here but should be fine as truncating (rounding) to nearest mm will be fine
-  static int lastX = 0;       // Stores the previous X value
-  static int lastY = 0;       // Stores the previous Y value
+bool areValuesStable(float currentX, float currentY) { // there is a type mismatch here but should be fine as truncating (rounding) to nearest mm will be fine
+  static float lastX = 0.0;       // Stores the previous X value
+  static float lastY = 0.0;       // Stores the previous Y value
   static int count = 0;       // Tracks consecutive matches for both
 
-  // Check if BOTH values are exactly the same as last time
-  if ((currentX == lastX) && (currentY == lastY)) {
+  // Check if BOTH values are exactly the same as last time -  Use a small tolerance rather than exact equality for floats
+  if (fabs(currentX - lastX) < 1.0 && fabs(currentY - lastY) < 1.0) { // TODO - adjust if tolerance is too little
     count++;
   } else {
-    // If EITHER value changed, update our records and reset the count
     lastX = currentX;
     lastY = currentY;
-    count = 1; 
+    count = 1;
   }
 
-  // Check if they've both been stable for 10 in a row // TODO ADJUST THIS ACCORDINGLY DEPENDING ON CAMERA!
-  if (count >= 10) {
-    // reset count
-    count = 0; 
+  // Check if they've both been stable for X in a row
+  if (count >= 10) { // TODO: adjust for your camera update rate
+    count = 0; // reset count
     return true;
   }
   return false;
@@ -213,55 +361,8 @@ bool areValuesStable(int currentX, int currentY) { // there is a type mismatch h
 
 
 // =======================================================
-//  DISC OPERATIONS
+//  Gripper
 // =======================================================
-void pickUpDisc() {
-  // performs pickup procedure
-
-  // PROCESS:
-  // -> move prismatic joint down to position 0
-  // -> close gripper
-  // -> move prismatic joint up to position X
-
-  openGripper();
-  if (stepper1.distanceToGo() == 0)
-  stepper1.moveTo(0);
-  closeGripper();
-  stepper1.moveTo(@@); // TODO CALIBRATE THIS VALUE
-}
-
-void deliverDisc() {
-  // performs the dropoff procedure. 
-
-  // PROCESS: 
-  // -> EE moves to lift up position
-  // -> prismatic joint lifts up
-  // -> EE moves to dropoff location
-  // -> servo is opened and disc is dropped
-  // -> EE moves to lift up position
-  // -> prismatic joint drops down 
-
-  Serial.println("Dropping off the Disc - Kachow!");
-  moveToPos(-148, 190);
-  stepper1.moveTo(2500); // TODO CALIBRATE THIS VALUE
-  moveToPos(@@); // TODO DETERMINE X,Y COORDS OF DROPOFF LOCATION
-  openGripper();
-  moveToPos(-148, 190);
-  stepper1.moveTo(0 + x); // TODO CALIBRATE THIS VALUE (i.e. 0 + x)
-  resetPosition();
-}
-
-void resetPosition() {
-  // is lift up pos in way of cam?  if so sol is to locate next disc whilst above flipping station or return to home position. - could add dual compatibility
-  stepper1.moveTo(0 + 500); // Home position + ~2cm - TODO CALIBRATE THIS POS (End effector should be ~ 2cm from gnd)
-  stepper2.moveTo(THETA1_HOME_DEG * STEPS_PER_DEG); // Home position
-  stepper3.moveTo(-THETA2_HOME_DEG * STEPS_PER_DEG); // Home position
-  if (stepper1.distanceToGo() == 0 && stepper2.distanceToGo() == 0 && stepper3.distanceToGo() == 0) {
-    locatingDisc = true;
-    deliveringDisc = false;
-  }
-}
-
 void closeGripper() {
   gripperServo.write(5);
 }
@@ -311,6 +412,7 @@ void moveToPos(float x, float y) {
     final_t1 = t1_deg_B; final_t2 = t2_deg_B;
   } else {
     Serial.println("CRITICAL WARNING: BOTH JOINT LIMITS HIT - IK IS UNSOLVABLE");
+    return;
   }
 
   // Convert degrees to stepper motor steps
@@ -329,19 +431,22 @@ bool checkLimits(float t1, float t2) {
 }
 
 void homeRobot() { // TODO - this will need configuring - how fast and in what direction (-300) does each arm turn when resetting (are the limit pins the right way around?)
+  // Limit switch on LIMIT_PIN_Z is on the Z axis for prismatic joint
+  // Limit switch on LIMIT_PIN_XY is mounted onto the SCARA and is triggered by the elbow joint
+
   // --- Prismatic joint (stepper1) ---
   stepper1.setSpeed(-300); // Adjust sign if it spins the wrong way
-  while (digitalRead(LIMIT_PIN_2) == HIGH) {
+  while (digitalRead(LIMIT_PIN_Z) == HIGH) {
     stepper1.runSpeed();
   }
   stepper1.stop();
   stepper1.setCurrentPosition(0); // Note that stepper 1 is positive up
 
   // --- Elbow and Shoulder revolute joints ---
-  // Is it a good or bad idea to move elbow say 90deg clockwise to avoid failure in homing (collision). Can motors determine when steps are missed without encoder?
+  // Is it a good or bad idea to move elbow say 90deg clockwise to avoid failure in homing (collision).
   stepper2.setSpeed(-300); // Shoulder - Adjust sign if it spins the wrong way
   stepper3.setSpeed(-100); // Elbow - Adjust sign if it spins the wrong way
-  while (digitalRead(LIMIT_PIN_3) == HIGH) {
+  while (digitalRead(LIMIT_PIN_XY) == HIGH) {
     stepper2.runSpeed();
     stepper3.runSpeed();
   }
@@ -352,5 +457,5 @@ void homeRobot() { // TODO - this will need configuring - how fast and in what d
   stepper3.setCurrentPosition(-THETA2_HOME_DEG * STEPS_PER_DEG); // Note that stepper 3 is positive clockwise
 
   Serial.println("Homing Complete. Torquey is operational!");
-  // delay(1000) // delay?
+  transitionTo(STATE_LOCATING_DISC);
 }
