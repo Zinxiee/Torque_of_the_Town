@@ -1,0 +1,802 @@
+#include <AccelStepper.h>
+#include <ESP32Servo.h>
+#include <HardwareSerial.h>
+#include <math.h>
+
+
+// Improvements:
+//   - 2-stage homing for Z
+//   - 2-stage combined homing for XY origin pose
+//   - home pose stored as motor step zero
+//   - angle conversion relative to known XY origin angles
+//   - coordinated XY motion for better simultaneous arrival
+//   - nearest valid IK branch selection
+//   - fast-then-slow Z descent
+//   - non-blocking camera input
+//
+// ============================================================
+
+// ==========================================
+//  HARDWARE PINS
+// ==========================================
+
+// Z-axis
+#define M1_STEP_PIN 4
+#define M1_DIR_PIN  5
+#define LIMIT_PIN_Z 10
+
+// Shoulder
+#define M2_STEP_PIN 6
+#define M2_DIR_PIN  7
+
+// Elbow
+#define M3_STEP_PIN 15
+#define M3_DIR_PIN  16
+
+// Shared XY origin switch
+#define LIMIT_PIN_XY 11
+
+// Camera Serial
+HardwareSerial CameraSerial(2);
+
+// Gripper servo
+Servo gripperServo;
+const int SERVO_PIN = 8;
+
+#define MOTOR_INTERFACE_TYPE 1
+
+AccelStepper stepper1(MOTOR_INTERFACE_TYPE, M1_STEP_PIN, M1_DIR_PIN); // Z
+AccelStepper stepper2(MOTOR_INTERFACE_TYPE, M2_STEP_PIN, M2_DIR_PIN); // shoulder
+AccelStepper stepper3(MOTOR_INTERFACE_TYPE, M3_STEP_PIN, M3_DIR_PIN); // elbow
+
+// ==========================================
+//  STATE MACHINE
+// ==========================================
+
+enum RobotState {
+  STATE_IDLE,
+  STATE_LOCATING_DISC,
+  STATE_MOVING_TO_DISC,
+  STATE_PICKUP_DESCEND_FAST,
+  STATE_PICKUP_DESCEND_SLOW,
+  STATE_PICKUP_CLOSE,
+  STATE_PICKUP_ASCEND,
+  STATE_DELIVER_MOVE_SAFE,
+  STATE_DELIVER_MOVE_DROP,
+  STATE_DELIVER_DESCEND_FAST,
+  STATE_DELIVER_DESCEND_SLOW,
+  STATE_DELIVER_OPEN,
+  STATE_RETURN_ASCEND,
+  STATE_RETURN_HOME
+};
+
+RobotState currentState = STATE_IDLE;
+unsigned long stateTimer = 0;
+
+// ==========================================
+//  CAMERA BUFFER
+// ==========================================
+
+String cameraLine = "";
+
+// ==========================================
+//  ROBOT GEOMETRY
+// ==========================================
+
+const float L1 = 110.0f;
+const float L2 = 130.0f;
+
+// ==========================================
+//  XY HOME POSE ANGLES
+// ============================================================
+//
+// These are the TRUE math-model angles when the SHARED XY switch fires.
+// Because you only have one XY switch, this switch defines one known pose.
+//
+// theta1 = shoulder absolute angle, CCW positive from +X
+// theta2 = elbow relative angle used in IK
+//
+const float THETA1_HOME_DEG = 107.0f;
+const float THETA2_HOME_DEG = 57.0f;
+
+// ==========================================
+//  JOINT LIMITS
+// ==========================================
+
+const float THETA1_MIN_DEG = -90.0f;
+const float THETA1_MAX_DEG = 107.0f;
+
+const float THETA2_MIN_DEG = -120.0f;
+const float THETA2_MAX_DEG = 57.0f;
+
+// ==========================================
+//  MOTOR SCALING / DIRECTION
+// ==========================================
+
+const float STEPS_PER_DEG = (200.0f * 8.0f * 4.0f) / 360.0f;
+const float Z_STEPS_PER_MM = 40.0f;
+
+// Motion direction signs
+const float SHOULDER_DIR = +1.0f;
+const float ELBOW_DIR    = -1.0f;
+
+// Homing direction signs
+// Must drive each axis toward its switch
+const float Z_HOME_DIR        = -1.0f;
+const float SHOULDER_HOME_DIR = -1.0f;
+const float ELBOW_HOME_DIR    = -1.0f;
+
+// ==========================================
+//  SPEED / ACCELERATION
+// ==========================================
+
+// Z
+const float Z_MAX_SPEED_TRAVEL = 1200.0f;
+const float Z_ACCEL_TRAVEL     = 1000.0f;
+
+const float Z_MAX_SPEED_SLOW   = 350.0f;
+const float Z_ACCEL_SLOW       = 500.0f;
+
+// XY
+const float SH_BASE_MAX_SPEED = 1800.0f;
+const float SH_BASE_ACCEL     = 1200.0f;
+
+const float EL_BASE_MAX_SPEED = 1800.0f;
+const float EL_BASE_ACCEL     = 1000.0f;
+
+const float XY_MIN_SPEED = 350.0f;
+const float XY_MIN_ACCEL = 250.0f;
+
+// Homing
+const float HOME_FAST_SPEED_Z  = 700.0f;
+const float HOME_SLOW_SPEED_Z  = 180.0f;
+
+const float HOME_FAST_SPEED_XY_SH = 700.0f;
+const float HOME_FAST_SPEED_XY_EL = 500.0f;
+
+const float HOME_SLOW_SPEED_XY_SH = 180.0f;
+const float HOME_SLOW_SPEED_XY_EL = 140.0f;
+
+const long HOME_BACKOFF_STEPS_Z  = 120;
+const long HOME_BACKOFF_STEPS_SH = 120;
+const long HOME_BACKOFF_STEPS_EL = 120;
+
+const unsigned long HOME_TIMEOUT_MS = 12000;
+
+// ==========================================
+//  TASK / HEIGHTS
+// ==========================================
+
+const long Z_TRAVEL_HEIGHT      = 220;
+const long Z_DISC_LEVEL         = 0;
+const long Z_DISC_APPROACH      = 30;
+const long Z_DROPOFF_HEIGHT     = 40;
+const long Z_DROPOFF_APPROACH   = 70;
+const long Z_OBSERVE_HEIGHT     = 500;
+
+const float SAFE_XY_X = -148.0f;
+const float SAFE_XY_Y =  190.0f;
+
+// TODO: replace with actual dropoff
+const float DROPOFF_X = -148.0f;
+const float DROPOFF_Y =  190.0f;
+
+const unsigned long GRIPPER_SETTLE_MS = 180;
+
+// ==========================================
+//  CAMERA CALIBRATION
+// ==========================================
+
+float p1 = 0.907631f;
+float p2 = -0.017293f;
+float tx = -259.497903f;
+float ty = -140.493713f;
+
+// ==========================================
+//  SETUP
+// ==========================================
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("SCARA v2 (2-switch) starting...");
+
+  pinMode(LIMIT_PIN_Z, INPUT_PULLUP);
+  pinMode(LIMIT_PIN_XY, INPUT_PULLUP);
+
+  stepper1.setMinPulseWidth(20);
+  stepper2.setMinPulseWidth(20);
+  stepper3.setMinPulseWidth(20);
+
+  stepper1.setMaxSpeed(Z_MAX_SPEED_TRAVEL);
+  stepper1.setAcceleration(Z_ACCEL_TRAVEL);
+
+  stepper2.setMaxSpeed(SH_BASE_MAX_SPEED);
+  stepper2.setAcceleration(SH_BASE_ACCEL);
+
+  stepper3.setMaxSpeed(EL_BASE_MAX_SPEED);
+  stepper3.setAcceleration(EL_BASE_ACCEL);
+
+  gripperServo.setPeriodHertz(50);
+  gripperServo.attach(SERVO_PIN, 500, 2400);
+  gripperServo.write(55);
+
+  CameraSerial.begin(9600, SERIAL_8N1, 17, 18);
+
+  if (!homeRobot()) {
+    Serial.println("FATAL: Homing failed.");
+    while (true) { }
+  }
+
+  moveZTravel(Z_OBSERVE_HEIGHT);
+  transitionTo(STATE_LOCATING_DISC);
+}
+
+// ==========================================
+//  MAIN LOOP
+// ==========================================
+
+void loop() {
+  stepper1.run();
+  stepper2.run();
+  stepper3.run();
+
+  updateCameraBuffer();
+
+  switch (currentState) {
+    case STATE_IDLE:
+      break;
+
+    case STATE_LOCATING_DISC:
+      handleLocatingDisc();
+      break;
+
+    case STATE_MOVING_TO_DISC:
+      if (motorsIdle(false, true, true)) {
+        moveZTravel(Z_DISC_APPROACH);
+        transitionTo(STATE_PICKUP_DESCEND_FAST);
+      }
+      break;
+
+    case STATE_PICKUP_DESCEND_FAST:
+      if (motorsIdle(true, false, false)) {
+        moveZSlow(Z_DISC_LEVEL);
+        transitionTo(STATE_PICKUP_DESCEND_SLOW);
+      }
+      break;
+
+    case STATE_PICKUP_DESCEND_SLOW:
+      if (motorsIdle(true, false, false)) {
+        closeGripper();
+        stateTimer = millis();
+        transitionTo(STATE_PICKUP_CLOSE);
+      }
+      break;
+
+    case STATE_PICKUP_CLOSE:
+      if (millis() - stateTimer >= GRIPPER_SETTLE_MS) {
+        moveZTravel(Z_TRAVEL_HEIGHT);
+        transitionTo(STATE_PICKUP_ASCEND);
+      }
+      break;
+
+    case STATE_PICKUP_ASCEND:
+      if (motorsIdle(true, false, false)) {
+        if (moveToPos(SAFE_XY_X, SAFE_XY_Y)) {
+          transitionTo(STATE_DELIVER_MOVE_SAFE);
+        } else {
+          Serial.println("ERROR: Safe XY unreachable");
+          transitionTo(STATE_IDLE);
+        }
+      }
+      break;
+
+    case STATE_DELIVER_MOVE_SAFE:
+      if (motorsIdle(false, true, true)) {
+        if (moveToPos(DROPOFF_X, DROPOFF_Y)) {
+          transitionTo(STATE_DELIVER_MOVE_DROP);
+        } else {
+          Serial.println("ERROR: Dropoff XY unreachable");
+          transitionTo(STATE_IDLE);
+        }
+      }
+      break;
+
+    case STATE_DELIVER_MOVE_DROP:
+      if (motorsIdle(false, true, true)) {
+        moveZTravel(Z_DROPOFF_APPROACH);
+        transitionTo(STATE_DELIVER_DESCEND_FAST);
+      }
+      break;
+
+    case STATE_DELIVER_DESCEND_FAST:
+      if (motorsIdle(true, false, false)) {
+        moveZSlow(Z_DROPOFF_HEIGHT);
+        transitionTo(STATE_DELIVER_DESCEND_SLOW);
+      }
+      break;
+
+    case STATE_DELIVER_DESCEND_SLOW:
+      if (motorsIdle(true, false, false)) {
+        openGripper();
+        stateTimer = millis();
+        transitionTo(STATE_DELIVER_OPEN);
+      }
+      break;
+
+    case STATE_DELIVER_OPEN:
+      if (millis() - stateTimer >= GRIPPER_SETTLE_MS) {
+        moveZTravel(Z_TRAVEL_HEIGHT);
+        transitionTo(STATE_RETURN_ASCEND);
+      }
+      break;
+
+    case STATE_RETURN_ASCEND:
+      if (motorsIdle(true, false, false)) {
+        long home2 = shoulderAngleToSteps(THETA1_HOME_DEG);
+        long home3 = elbowAngleToSteps(THETA2_HOME_DEG);
+        moveArmJointsCoordinated(home2, home3);
+        transitionTo(STATE_RETURN_HOME);
+      }
+      break;
+
+    case STATE_RETURN_HOME:
+      if (motorsIdle(false, true, true)) {
+        moveZTravel(Z_OBSERVE_HEIGHT);
+        transitionTo(STATE_LOCATING_DISC);
+      }
+      break;
+  }
+}
+
+// ==========================================
+//  STATE HELPERS
+// ==========================================
+
+void transitionTo(RobotState newState) {
+  Serial.print("State: ");
+  Serial.print(currentState);
+  Serial.print(" -> ");
+  Serial.println(newState);
+  currentState = newState;
+}
+
+bool motorsIdle(bool checkZ, bool checkShoulder, bool checkElbow) {
+  if (checkZ && stepper1.distanceToGo() != 0) return false;
+  if (checkShoulder && stepper2.distanceToGo() != 0) return false;
+  if (checkElbow && stepper3.distanceToGo() != 0) return false;
+  return true;
+}
+
+// ==========================================
+//  CAMERA
+// ==========================================
+
+void updateCameraBuffer() {
+  while (CameraSerial.available()) {
+    char c = (char)CameraSerial.read();
+
+    if (c == '\n') {
+      cameraLine.trim();
+      return;
+    } else if (c != '\r') {
+      cameraLine += c;
+      if (cameraLine.length() > 64) {
+        cameraLine = "";
+      }
+    }
+  }
+}
+
+void handleLocatingDisc() {
+  if (cameraLine.length() == 0) return;
+
+  String line = cameraLine;
+  cameraLine = "";
+
+  if (line == "NONE") {
+    return;
+  }
+
+  int raw_pixel_x = 0;
+  int raw_pixel_y = 0;
+  float target_mm_x = 0.0f;
+  float target_mm_y = 0.0f;
+
+  if (sscanf(line.c_str(), "X:%d,Y:%d", &raw_pixel_x, &raw_pixel_y) == 2) {
+    calculateDiscLocation((float)raw_pixel_x, (float)raw_pixel_y, target_mm_x, target_mm_y);
+
+    Serial.printf("Potential Disc -> X: %.1f mm, Y: %.1f mm\n", target_mm_x, target_mm_y);
+
+    if (areValuesStable(target_mm_x, target_mm_y)) {
+      Serial.printf("Moving to Disc -> X: %.1f mm, Y: %.1f mm\n", target_mm_x, target_mm_y);
+
+      if (moveToPos(target_mm_x, target_mm_y)) {
+        transitionTo(STATE_MOVING_TO_DISC);
+      }
+    }
+  }
+}
+
+void calculateDiscLocation(float pixel_x, float pixel_y, float &world_x, float &world_y) {
+  world_x = (p1 * pixel_x) - (p2 * pixel_y) + tx;
+  world_y = (p2 * pixel_x) + (p1 * pixel_y) + ty;
+}
+
+bool areValuesStable(float currentX, float currentY) {
+  static float lastX = 0.0f;
+  static float lastY = 0.0f;
+  static int count = 0;
+
+  if (fabs(currentX - lastX) < 1.0f && fabs(currentY - lastY) < 1.0f) {
+    count++;
+  } else {
+    lastX = currentX;
+    lastY = currentY;
+    count = 1;
+  }
+
+  if (count >= 5) {
+    count = 0;
+    return true;
+  }
+  return false;
+}
+
+// ==========================================
+//  GRIPPER
+// ==========================================
+
+void closeGripper() {
+  gripperServo.write(5);
+}
+
+void openGripper() {
+  gripperServo.write(55);
+}
+
+// ==========================================
+//  MATH HELPERS
+// ==========================================
+
+float normalize180(float a) {
+  while (a > 180.0f) a -= 360.0f;
+  while (a <= -180.0f) a += 360.0f;
+  return a;
+}
+
+float angleDiffDeg(float a, float b) {
+  return fabs(normalize180(a - b));
+}
+
+bool checkLimits(float t1, float t2) {
+  return (t1 >= THETA1_MIN_DEG && t1 <= THETA1_MAX_DEG &&
+          t2 >= THETA2_MIN_DEG && t2 <= THETA2_MAX_DEG);
+}
+
+// Switch-trigger pose = motor step zero
+long shoulderAngleToSteps(float theta1_deg) {
+  return lround(SHOULDER_DIR * (theta1_deg - THETA1_HOME_DEG) * STEPS_PER_DEG);
+}
+
+long elbowAngleToSteps(float theta2_deg) {
+  return lround(ELBOW_DIR * (theta2_deg - THETA2_HOME_DEG) * STEPS_PER_DEG);
+}
+
+float currentTheta1Deg() {
+  return (stepper2.currentPosition() / (SHOULDER_DIR * STEPS_PER_DEG)) + THETA1_HOME_DEG;
+}
+
+float currentTheta2Deg() {
+  return (stepper3.currentPosition() / (ELBOW_DIR * STEPS_PER_DEG)) + THETA2_HOME_DEG;
+}
+
+// ==========================================
+//  COORDINATED XY MOTION
+// ==========================================
+
+void moveArmJointsCoordinated(long target_steps_2, long target_steps_3) {
+  long d2 = labs(target_steps_2 - stepper2.currentPosition());
+  long d3 = labs(target_steps_3 - stepper3.currentPosition());
+
+  if (d2 == 0 && d3 == 0) return;
+
+  if (d2 >= d3 && d2 > 0) {
+    float ratio = (float)d3 / (float)d2;
+
+    stepper2.setMaxSpeed(SH_BASE_MAX_SPEED);
+    stepper2.setAcceleration(SH_BASE_ACCEL);
+
+    stepper3.setMaxSpeed(max(XY_MIN_SPEED, EL_BASE_MAX_SPEED * ratio));
+    stepper3.setAcceleration(max(XY_MIN_ACCEL, EL_BASE_ACCEL * ratio));
+  } else if (d3 > 0) {
+    float ratio = (float)d2 / (float)d3;
+
+    stepper3.setMaxSpeed(EL_BASE_MAX_SPEED);
+    stepper3.setAcceleration(EL_BASE_ACCEL);
+
+    stepper2.setMaxSpeed(max(XY_MIN_SPEED, SH_BASE_MAX_SPEED * ratio));
+    stepper2.setAcceleration(max(XY_MIN_ACCEL, SH_BASE_ACCEL * ratio));
+  }
+
+  stepper2.moveTo(target_steps_2);
+  stepper3.moveTo(target_steps_3);
+
+  Serial.print("Coordinated XY -> shoulder steps: ");
+  Serial.print(target_steps_2);
+  Serial.print(" elbow steps: ");
+  Serial.println(target_steps_3);
+}
+
+// ==========================================
+//  Z HELPERS
+// ==========================================
+
+void moveZTravel(long targetSteps) {
+  stepper1.setMaxSpeed(Z_MAX_SPEED_TRAVEL);
+  stepper1.setAcceleration(Z_ACCEL_TRAVEL);
+  stepper1.moveTo(targetSteps);
+}
+
+void moveZSlow(long targetSteps) {
+  stepper1.setMaxSpeed(Z_MAX_SPEED_SLOW);
+  stepper1.setAcceleration(Z_ACCEL_SLOW);
+  stepper1.moveTo(targetSteps);
+}
+
+// ==========================================
+//  INVERSE KINEMATICS
+// ==========================================
+
+bool moveToPos(float x, float y) {
+  float r_sq = x * x + y * y;
+  float r = sqrt(r_sq);
+
+  float max_reach = L1 + L2;
+  float min_reach = fabs(L1 - L2);
+
+  if (r > max_reach) {
+    Serial.println("IK: target too far");
+    return false;
+  }
+  if (r < min_reach) {
+    Serial.println("IK: target too close");
+    return false;
+  }
+
+  float cos_theta2 = (r_sq - (L1 * L1) - (L2 * L2)) / (2.0f * L1 * L2);
+  cos_theta2 = constrain(cos_theta2, -1.0f, 1.0f);
+
+  float t2A = acos(cos_theta2);
+  float t1A = atan2(y, x) - atan2(L2 * sin(t2A), L1 + L2 * cos(t2A));
+  float t1A_deg = normalize180(t1A * 180.0f / PI);
+  float t2A_deg = normalize180(t2A * 180.0f / PI);
+
+  float t2B = -acos(cos_theta2);
+  float t1B = atan2(y, x) - atan2(L2 * sin(t2B), L1 + L2 * cos(t2B));
+  float t1B_deg = normalize180(t1B * 180.0f / PI);
+  float t2B_deg = normalize180(t2B * 180.0f / PI);
+
+  bool validA = checkLimits(t1A_deg, t2A_deg);
+  bool validB = checkLimits(t1B_deg, t2B_deg);
+
+  float final_t1 = 0.0f;
+  float final_t2 = 0.0f;
+
+  if (validA && validB) {
+    float curT1 = currentTheta1Deg();
+    float curT2 = currentTheta2Deg();
+
+    float distA = angleDiffDeg(t1A_deg, curT1) + angleDiffDeg(t2A_deg, curT2);
+    float distB = angleDiffDeg(t1B_deg, curT1) + angleDiffDeg(t2B_deg, curT2);
+
+    if (distA <= distB) {
+      final_t1 = t1A_deg;
+      final_t2 = t2A_deg;
+      Serial.println("IK: branch A");
+    } else {
+      final_t1 = t1B_deg;
+      final_t2 = t2B_deg;
+      Serial.println("IK: branch B");
+    }
+  } else if (validA) {
+    final_t1 = t1A_deg;
+    final_t2 = t2A_deg;
+    Serial.println("IK: valid A");
+  } else if (validB) {
+    final_t1 = t1B_deg;
+    final_t2 = t2B_deg;
+    Serial.println("IK: valid B");
+  } else {
+    Serial.println("IK unsolvable within joint limits");
+    return false;
+  }
+
+  long target_steps_2 = shoulderAngleToSteps(final_t1);
+  long target_steps_3 = elbowAngleToSteps(final_t2);
+
+  moveArmJointsCoordinated(target_steps_2, target_steps_3);
+
+  Serial.print("Target Angles -> Shoulder: ");
+  Serial.print(final_t1);
+  Serial.print("  Elbow: ");
+  Serial.println(final_t2);
+
+  return true;
+}
+
+// ==========================================
+//  HOMING HELPERS
+// ==========================================
+
+bool runMotorToTarget(AccelStepper &motor, unsigned long timeoutMs, const char* name) {
+  unsigned long t0 = millis();
+
+  while (motor.distanceToGo() != 0) {
+    motor.run();
+
+    if (millis() - t0 > timeoutMs) {
+      Serial.print("[MOVE] TIMEOUT on ");
+      Serial.println(name);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool homeSingleAxisTwoStage(AccelStepper &motor,
+                            int limitPin,
+                            float homeDirSign,
+                            float fastSpeedMag,
+                            float slowSpeedMag,
+                            long backoffSteps,
+                            const char* name) {
+  unsigned long t0;
+
+  Serial.print("[HOME] ");
+  Serial.print(name);
+  Serial.println(" fast approach...");
+  motor.setSpeed(homeDirSign * fastSpeedMag);
+  t0 = millis();
+
+  while (digitalRead(limitPin) == HIGH) {
+    motor.runSpeed();
+    if (millis() - t0 > HOME_TIMEOUT_MS) {
+      Serial.print("[HOME] TIMEOUT fast on ");
+      Serial.println(name);
+      return false;
+    }
+  }
+
+  delay(40);
+
+  motor.setCurrentPosition(0);
+  long backoffTarget = (homeDirSign > 0.0f) ? -backoffSteps : backoffSteps;
+  motor.moveTo(backoffTarget);
+
+  if (!runMotorToTarget(motor, HOME_TIMEOUT_MS, name)) {
+    return false;
+  }
+
+  delay(40);
+
+  Serial.print("[HOME] ");
+  Serial.print(name);
+  Serial.println(" slow re-approach...");
+  motor.setSpeed(homeDirSign * slowSpeedMag);
+  t0 = millis();
+
+  while (digitalRead(limitPin) == HIGH) {
+    motor.runSpeed();
+    if (millis() - t0 > HOME_TIMEOUT_MS) {
+      Serial.print("[HOME] TIMEOUT slow on ");
+      Serial.println(name);
+      return false;
+    }
+  }
+
+  delay(40);
+
+  motor.setCurrentPosition(0);
+  Serial.print("[HOME] ");
+  Serial.print(name);
+  Serial.println(" homed.");
+  return true;
+}
+
+// Combined XY homing for one shared switch
+bool homeXYTogetherTwoStage() {
+  unsigned long t0;
+
+  // -------------------------------
+  // Fast approach
+  // -------------------------------
+  Serial.println("[HOME] XY fast approach...");
+  stepper2.setSpeed(SHOULDER_HOME_DIR * HOME_FAST_SPEED_XY_SH);
+  stepper3.setSpeed(ELBOW_HOME_DIR    * HOME_FAST_SPEED_XY_EL);
+  t0 = millis();
+
+  while (digitalRead(LIMIT_PIN_XY) == HIGH) {
+    stepper2.runSpeed();
+    stepper3.runSpeed();
+
+    if (millis() - t0 > HOME_TIMEOUT_MS) {
+      Serial.println("[HOME] TIMEOUT fast on XY");
+      return false;
+    }
+  }
+
+  delay(40);
+
+  // -------------------------------
+  // Back off both joints
+  // -------------------------------
+  Serial.println("[HOME] XY back-off...");
+  stepper2.setCurrentPosition(0);
+  stepper3.setCurrentPosition(0);
+
+  long shBackoff = (SHOULDER_HOME_DIR > 0.0f) ? -HOME_BACKOFF_STEPS_SH : HOME_BACKOFF_STEPS_SH;
+  long elBackoff = (ELBOW_HOME_DIR    > 0.0f) ? -HOME_BACKOFF_STEPS_EL : HOME_BACKOFF_STEPS_EL;
+
+  stepper2.moveTo(shBackoff);
+  stepper3.moveTo(elBackoff);
+
+  unsigned long tBack = millis();
+  while (stepper2.distanceToGo() != 0 || stepper3.distanceToGo() != 0) {
+    stepper2.run();
+    stepper3.run();
+
+    if (millis() - tBack > HOME_TIMEOUT_MS) {
+      Serial.println("[HOME] TIMEOUT during XY back-off");
+      return false;
+    }
+  }
+
+  delay(40);
+
+  // -------------------------------
+  // Slow re-approach
+  // -------------------------------
+  Serial.println("[HOME] XY slow re-approach...");
+  stepper2.setSpeed(SHOULDER_HOME_DIR * HOME_SLOW_SPEED_XY_SH);
+  stepper3.setSpeed(ELBOW_HOME_DIR    * HOME_SLOW_SPEED_XY_EL);
+  t0 = millis();
+
+  while (digitalRead(LIMIT_PIN_XY) == HIGH) {
+    stepper2.runSpeed();
+    stepper3.runSpeed();
+
+    if (millis() - t0 > HOME_TIMEOUT_MS) {
+      Serial.println("[HOME] TIMEOUT slow on XY");
+      return false;
+    }
+  }
+
+  delay(40);
+
+  // Shared XY origin pose = zero motor steps
+  stepper2.setCurrentPosition(0);
+  stepper3.setCurrentPosition(0);
+
+  Serial.println("[HOME] XY homed at shared origin pose.");
+  return true;
+}
+
+bool homeRobot() {
+  Serial.println("[HOME] Starting 2-switch homing...");
+
+  if (!homeSingleAxisTwoStage(stepper1, LIMIT_PIN_Z,
+                              Z_HOME_DIR,
+                              HOME_FAST_SPEED_Z,
+                              HOME_SLOW_SPEED_Z,
+                              HOME_BACKOFF_STEPS_Z,
+                              "Z")) {
+    return false;
+  }
+
+  if (!homeXYTogetherTwoStage()) {
+    return false;
+  }
+
+  Serial.println("[HOME] All axes homed.");
+  return true;
+}
