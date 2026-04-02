@@ -1,6 +1,6 @@
 #include <AccelStepper.h>
-#include <ESP32Servo.h>
 #include <HardwareSerial.h>
+#include "driver/ledc.h"
 #include <math.h>
 
 // ==========================================
@@ -9,24 +9,23 @@
 // Motor 1 (Prismatic Z-Axis)
 #define M1_STEP_PIN 4
 #define M1_DIR_PIN  5
-#define LIMIT_PIN_Z 10 // TODO THIS MUST BE CHANGED
+#define LIMIT_PIN_Z 7
 
 // Motor 2 (Shoulder - Rotary 1)
-#define M2_STEP_PIN 6
-#define M2_DIR_PIN  7
+#define M2_STEP_PIN 42
+#define M2_DIR_PIN  41
 
 // Motor 3 (Elbow - Rotary 2)
 #define M3_STEP_PIN 15
 #define M3_DIR_PIN  16
 
-#define LIMIT_PIN_XY 11 // TODO THIS MUST BE CHANGED
+#define LIMIT_PIN_XY 6 
 
 // Camera Serial connection
 HardwareSerial CameraSerial(2); 
 
 // End effector servo
-Servo gripperServo;
-const int SERVO_PIN = 8; // TODO miht need to be changed
+const int SERVO_PIN = 40;
 
 #define MOTOR_INTERFACE_TYPE 1
 
@@ -141,12 +140,12 @@ void setup() {
   stepper3.setCurrentPosition(-THETA2_HOME_DEG * STEPS_PER_DEG); // Note that stepper 3 is positive clockwise
 
   // End-Effector config
-  gripperServo.setPeriodHertz(50);
-  gripperServo.attach(SERVO_PIN, 500, 2400);
-  gripperServo.write(55); // TODO Start angle of 55 might need to be changed
+  ledcAttach(SERVO_PIN, 50, 16);  // pin, 50Hz, 16-bit resolution
+  writeServoUs(500);   // fully open  (was gripperServo.write(55)) - TODO Start angle of 55 might need to be changed
 
   // Start connection to the Camera (RX, TX)
   CameraSerial.setTimeout(20); 
+  Serial.println("5");
   CameraSerial.begin(9600, SERIAL_8N1, 17, 18); // note slower serial for camera 
   Serial.println("Torquey is ...  A L I V E");
 
@@ -291,6 +290,14 @@ bool motorsIdle(bool checkZ, bool checkShoulder, bool checkElbow) {
   return true;
 }
 
+// =======================================================
+//  SERVO
+// =======================================================
+void writeServoUs(int microseconds) {
+  // 16-bit at 50Hz: full period = 65536 ticks = 20000us
+  uint32_t duty = (uint32_t)microseconds * 65536 / 20000;
+  ledcWrite(SERVO_PIN, duty);
+}
 
 // =======================================================
 //  CAMERA
@@ -364,11 +371,11 @@ bool areValuesStable(float currentX, float currentY) { // there is a type mismat
 //  Gripper
 // =======================================================
 void closeGripper() {
-  gripperServo.write(5);
+  writeServoUs(2400);  // fully closed (was gripperServo.write(5))
 }
 
 void openGripper() {
-  gripperServo.write(55); // can go to around 145
+  writeServoUs(500);   // fully open  (was gripperServo.write(55)) - could go to around 145
 }
 
 
@@ -444,8 +451,8 @@ void homeRobot() { // TODO - this will need configuring - how fast and in what d
 
   // --- Elbow and Shoulder revolute joints ---
   // Is it a good or bad idea to move elbow say 90deg clockwise to avoid failure in homing (collision).
-  stepper2.setSpeed(-300); // Shoulder - Adjust sign if it spins the wrong way
-  stepper3.setSpeed(-100); // Elbow - Adjust sign if it spins the wrong way
+  stepper2.setSpeed(300); // Shoulder - Adjust sign if it spins the wrong way
+  stepper3.setSpeed(-130); // Elbow - Adjust sign if it spins the wrong way
   while (digitalRead(LIMIT_PIN_XY) == HIGH) {
     stepper2.runSpeed();
     stepper3.runSpeed();
