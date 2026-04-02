@@ -224,6 +224,7 @@ void pickUpDisc() {
   // -> move prismatic joint up to position X
 
   openGripper();
+  if (stepper1.distanceToGo() == 0)
   stepper1.moveTo(0);
   closeGripper();
   stepper1.moveTo(@@); // TODO CALIBRATE THIS VALUE
