@@ -25,7 +25,7 @@
 HardwareSerial CameraSerial(2); 
 
 // End effector servo
-const int SERVO_PIN = 40;
+const int SERVO_PIN = 8;
 
 #define MOTOR_INTERFACE_TYPE 1
 
@@ -50,6 +50,7 @@ enum RobotState {
   STATE_DELIVER_DESCEND,     // Z-axis lowering at dropoff
   STATE_DELIVER_OPEN,        // Gripper opening to release disc
   STATE_RETURN_ASCEND,       // Z-axis lifting back up after release
+  STATE_RETURN_SAFE,
   STATE_RETURN_HOME,         // Arm returning to home/observation position
 };
 
@@ -59,15 +60,14 @@ RobotState currentState = STATE_IDLE;
 unsigned long stateTimer = 0;
 
 // ---- Calibration values (fill these in once tested) ----
-const long Z_DISC_LEVEL     =    0;
-const long Z_TRAVEL_HEIGHT  = 200;   // TODO: steps for Z safe travel height
-const long Z_DROPOFF_HEIGHT = 200;   // TODO: steps for Z at dropoff height
-const long Z_OBSERVE_HEIGHT =  500;   // TODO: steps for Z in observation position (~2cm from gnd)
+const long Z_DISC_LEVEL     =   0;
+const long Z_TRAVEL_HEIGHT  = 2000;   // steps for Z safe travel height (~2cm from gnd)
+const long Z_DROPOFF_HEIGHT = 12200;   // steps for Z at dropoff height
 
 const float SAFE_XY_X = -148.0;      // Intermediate safe XY position before dropoff
 const float SAFE_XY_Y =  190.0;
-// float DROPOFF_X = ???;            // TODO: fill in flipping station dropoff XY
-// float DROPOFF_Y = ???;
+float DROPOFF_X = 55;            // flipping station dropoff XY
+float DROPOFF_Y = 180;
 
 const unsigned long GRIPPER_SETTLE_MS = 300; // Time to wait after closing/opening gripper // TODO - test this
 
@@ -116,7 +116,7 @@ void setup() {
   pinMode(LIMIT_PIN_Z, INPUT_PULLUP);
   pinMode(LIMIT_PIN_XY, INPUT_PULLUP);
 
-  // ESP32 potentially too fast for DM556 drivers, so this prevents skipping steps // TODO perhaps decrease
+  // ESP32 potentially too fast for DM556 drivers, so this prevents skipping steps // EXTRA perhaps decrease
   stepper1.setMinPulseWidth(20);
   stepper2.setMinPulseWidth(20);
   stepper3.setMinPulseWidth(20);
@@ -125,23 +125,23 @@ void setup() {
 
   // --- MOTOR 1 SETTINGS (Prismatic) ---
   stepper1.setMaxSpeed(800);      
-  stepper1.setAcceleration(700);  
+  stepper1.setAcceleration(500);  
 
   // --- MOTOR 2 SETTINGS (Shoulder) ---
-  stepper2.setMaxSpeed(1000);     
-  stepper2.setAcceleration(500);
+  stepper2.setMaxSpeed(6000);     
+  stepper2.setAcceleration(1000);
 
   // --- MOTOR 3 SETTINGS (Elbow) ---
-  stepper3.setMaxSpeed(1000);     
-  stepper3.setAcceleration(200);
+  stepper3.setMaxSpeed(6000);     
+  stepper3.setAcceleration(1000);
 
   // Set initial home positions
   stepper2.setCurrentPosition(THETA1_HOME_DEG * STEPS_PER_DEG); // Note that stepper 2 is positive anticlockwise
   stepper3.setCurrentPosition(-THETA2_HOME_DEG * STEPS_PER_DEG); // Note that stepper 3 is positive clockwise
 
   // End-Effector config
-  ledcAttach(SERVO_PIN, 50, 16);  // pin, 50Hz, 16-bit resolution
-  writeServoUs(500);   // fully open  (was gripperServo.write(55)) - TODO Start angle of 55 might need to be changed
+  ledcAttach(SERVO_PIN, 50, 14);  // pin, 50Hz, 16-bit resolution
+  writeServoUs(2000);   // fully open  (was gripperServo.write(55)) - EXTRA Start angle of 90 might need to be changed
 
   // Start connection to the Camera (RX, TX)
   CameraSerial.setTimeout(20); 
@@ -151,6 +151,7 @@ void setup() {
 
   Serial.println("Starting super fancy homing sequence...");
   homeRobot();
+  
 }
 
 void loop() { // no delays or while loops allowed!
@@ -195,7 +196,7 @@ void loop() { // no delays or while loops allowed!
       // Wait for Z-axis to reach disc level
       if (motorsIdle(true, false, false)) {
         // Z is down — now close the gripper
-        closeGripper();
+        writeServoUs(2400);  // fully closed (was gripperServo.write(5)) #TODO
         stateTimer = millis(); // Start settle timer
         transitionTo(STATE_PICKUP_CLOSE);
       }
@@ -213,27 +214,27 @@ void loop() { // no delays or while loops allowed!
       if (motorsIdle(true, false, false)) {
         // Safely up — move arms to safe XY before travelling to dropoff
         moveToPos(SAFE_XY_X, SAFE_XY_Y);
+        transitionTo(STATE_DELIVER_MOVE_DROP);
+      }
+      break;
+  
+    case STATE_DELIVER_MOVE_DROP:
+      if (motorsIdle(false, true, true)) {
+        stepper1.moveTo(Z_DROPOFF_HEIGHT); 
         transitionTo(STATE_DELIVER_MOVE_SAFE);
       }
       break;
 
     case STATE_DELIVER_MOVE_SAFE:
-      if (motorsIdle(false, true, true)) {
-        transitionTo(STATE_DELIVER_MOVE_DROP);
-        // moveToPos(DROPOFF_X, DROPOFF_Y); // TODO: uncomment once coords known
-      }
-      break;
-
-    case STATE_DELIVER_MOVE_DROP:
-      if (motorsIdle(false, true, true)) {
-        stepper1.moveTo(Z_DROPOFF_HEIGHT);
+      if (motorsIdle(true, true, true)) {
         transitionTo(STATE_DELIVER_DESCEND);
+        moveToPos(DROPOFF_X, DROPOFF_Y); 
       }
       break;
 
     case STATE_DELIVER_DESCEND:
       if (motorsIdle(true, false, false)) {
-        openGripper();
+        writeServoUs(500);   // fully open  (was gripperServo.write(90))
         stateTimer = millis();
         transitionTo(STATE_DELIVER_OPEN);
       }
@@ -246,9 +247,15 @@ void loop() { // no delays or while loops allowed!
       }
       break;
 
-    case STATE_RETURN_ASCEND:
+    case STATE_RETURN_ASCEND:         // wait for Z up
       if (motorsIdle(true, false, false)) {
-        // Return arms to observation/home position
+        moveToPos(SAFE_XY_X, SAFE_XY_Y);  // retrace back through safe XY
+        transitionTo(STATE_RETURN_SAFE);   // new state
+      }
+      break;
+
+    case STATE_RETURN_SAFE:           // wait for safe XY, then go home
+      if (motorsIdle(false, true, true)) {
         stepper2.moveTo(THETA1_HOME_DEG * STEPS_PER_DEG);
         stepper3.moveTo(-THETA2_HOME_DEG * STEPS_PER_DEG);
         transitionTo(STATE_RETURN_HOME);
@@ -258,7 +265,7 @@ void loop() { // no delays or while loops allowed!
     case STATE_RETURN_HOME:
       if (motorsIdle(false, true, true)) {
         // Lower Z to observation height, then start looking for the next disc
-        stepper1.moveTo(Z_OBSERVE_HEIGHT);
+        stepper1.moveTo(Z_TRAVEL_HEIGHT);
         // We don't wait for Z here — camera can start scanning straight away
         transitionTo(STATE_LOCATING_DISC);
       }
@@ -293,17 +300,19 @@ bool motorsIdle(bool checkZ, bool checkShoulder, bool checkElbow) {
 // =======================================================
 //  SERVO
 // =======================================================
-void writeServoUs(int microseconds) {
-  // 16-bit at 50Hz: full period = 65536 ticks = 20000us
-  uint32_t duty = (uint32_t)microseconds * 65536 / 20000;
-  ledcWrite(SERVO_PIN, duty);
+void writeServoUs(uint32_t microseconds) {
+  // Convert microseconds to a 14-bit duty cycle for a 50Hz signal
+  uint32_t dutyCycle = (microseconds * 65535) / 20000; 
+  
+  // Write the calculated duty cycle to the pin
+  ledcWrite(SERVO_PIN, dutyCycle);
 }
 
 // =======================================================
 //  CAMERA
 // =======================================================
 void handleLocatingDisc() {
-  if (!CameraSerial.available()) return; // TODO might be good to put a serial.print in this case
+  if (!CameraSerial.available()) return; // EXTRA might be good to put a serial.print in this case
     
   // Read the text until the end of the line
   String incomingData = CameraSerial.readStringUntil('\n'); // readStringUntil will stutter (and lose steps to) motors but should be fine as they shouldn't be moving for detection
@@ -350,7 +359,7 @@ bool areValuesStable(float currentX, float currentY) { // there is a type mismat
   static int count = 0;       // Tracks consecutive matches for both
 
   // Check if BOTH values are exactly the same as last time -  Use a small tolerance rather than exact equality for floats
-  if (fabs(currentX - lastX) < 1.0 && fabs(currentY - lastY) < 1.0) { // TODO - adjust if tolerance is too little
+  if (fabs(currentX - lastX) < 1.0 && fabs(currentY - lastY) < 1.0) { // EXTRA - adjust if tolerance is too little
     count++;
   } else {
     lastX = currentX;
@@ -359,7 +368,7 @@ bool areValuesStable(float currentX, float currentY) { // there is a type mismat
   }
 
   // Check if they've both been stable for X in a row
-  if (count >= 10) { // TODO: adjust for your camera update rate
+  if (count >= 10) { // EXTRA: adjust for your camera update rate
     count = 0; // reset count
     return true;
   }
@@ -371,11 +380,11 @@ bool areValuesStable(float currentX, float currentY) { // there is a type mismat
 //  Gripper
 // =======================================================
 void closeGripper() {
-  writeServoUs(2400);  // fully closed (was gripperServo.write(5))
+  writeServoUs(600);  // fully closed (was gripperServo.write(5))
 }
 
 void openGripper() {
-  writeServoUs(500);   // fully open  (was gripperServo.write(55)) - could go to around 145
+  writeServoUs(1500);   // fully open  (was gripperServo.write(90))
 }
 
 
@@ -386,7 +395,7 @@ void moveToPos(float x, float y) {
   // --- Reach Check ---
   float r = sqrt((x * x) + (y * y));
   float max_reach = L1 + L2;
-  if (r > max_reach + 17.0) { Serial.println("Out of reach!"); return; } // TODO - can we change this hardcoded 17?
+  if (r > max_reach + 17.0) { Serial.println("Out of reach!"); return; } // EXTRA - can we change this hardcoded 17?
   if (r > max_reach) { x *= (max_reach/r); y *= (max_reach/r); }
 
   float r_sq = (x * x) + (y * y);
@@ -437,7 +446,7 @@ bool checkLimits(float t1, float t2) {
   return (t1 >= THETA1_MIN_DEG && t1 <= THETA1_MAX_DEG && t2 >= THETA2_MIN_DEG && t2 <= THETA2_MAX_DEG);
 }
 
-void homeRobot() { // TODO - this will need configuring - how fast and in what direction (-300) does each arm turn when resetting (are the limit pins the right way around?)
+void homeRobot() { // EXTRA - this func might need additional configuration
   // Limit switch on LIMIT_PIN_Z is on the Z axis for prismatic joint
   // Limit switch on LIMIT_PIN_XY is mounted onto the SCARA and is triggered by the elbow joint
 
@@ -448,11 +457,12 @@ void homeRobot() { // TODO - this will need configuring - how fast and in what d
   }
   stepper1.stop();
   stepper1.setCurrentPosition(0); // Note that stepper 1 is positive up
+  stepper1.moveTo(Z_TRAVEL_HEIGHT);
 
   // --- Elbow and Shoulder revolute joints ---
   // Is it a good or bad idea to move elbow say 90deg clockwise to avoid failure in homing (collision).
   stepper2.setSpeed(300); // Shoulder - Adjust sign if it spins the wrong way
-  stepper3.setSpeed(-130); // Elbow - Adjust sign if it spins the wrong way
+  stepper3.setSpeed(-140); // Elbow - Adjust sign if it spins the wrong way
   while (digitalRead(LIMIT_PIN_XY) == HIGH) {
     stepper2.runSpeed();
     stepper3.runSpeed();
