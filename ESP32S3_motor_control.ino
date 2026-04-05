@@ -43,14 +43,13 @@ enum RobotState {
   STATE_MOVING_TO_DISC,      // Arm moving to disc XY position
   STATE_PICKUP_DESCEND,      // Z-axis lowering down to disc
   STATE_PICKUP_CLOSE,        // Gripper closing (instantaneous, but needs a small settle delay)
-  STATE_PICKUP_ASCEND,       // Z-axis raising back up with disc
-  STATE_DELIVER_MOVE_SAFE,   // Arm moving to a safe intermediate XY before travelling to dropoff
-  STATE_DELIVER_ASCEND,      // Z-axis lifting up to travel height at safe XY
-  STATE_DELIVER_MOVE_DROP,   // Arms moving to dropoff XY
-  STATE_DELIVER_DESCEND,     // Z-axis lowering at dropoff
-  STATE_DELIVER_OPEN,        // Gripper opening to release disc
-  STATE_RETURN_ASCEND,       // Z-axis lifting back up after release
-  STATE_RETURN_SAFE,
+  STATE_PICKUP_ASCEND,       // Z-axis raising back up with disc to travel height
+  STATE_DELIVER_MOVE_SAFE_POS,   // Arm moving to a safe intermediate XY before travelling to dropoff
+  STATE_DELIVER_DROPOFF_HEIGHT,   // Z-axis lifting up to drop off height at safe XY
+  STATE_DELIVER_MOVE_DROPOFF_POS,     // Arm moving to dropoff XY
+  STATE_DELIVER_DROPOFF,       // Gripper opening to release disc
+  STATE_RETURN_MOVE_SAFE,        // Arm returning to safe intermediate XY
+  STATE_RETURN_TRAVEL_HEIGHT, // Z-axis descending back to travel height
   STATE_RETURN_HOME,         // Arm returning to home/observation position
 };
 
@@ -60,7 +59,7 @@ RobotState currentState = STATE_IDLE;
 unsigned long stateTimer = 0;
 
 // ---- Calibration values (fill these in once tested) ----
-const long Z_DISC_LEVEL     =   0;
+const long Z_DISC_LEVEL     =   0; // TODO - test reducing this slightly (gripper appears to be abt 2mm from the ground. needs to be touching)
 const long Z_TRAVEL_HEIGHT  = 2000;   // steps for Z safe travel height (~2cm from gnd)
 const long Z_DROPOFF_HEIGHT = 12200;   // steps for Z at dropoff height
 
@@ -123,9 +122,9 @@ void setup() {
 
   // if motors make a whining noise, reduce acceleration (stepper motors can stall if accelerated too fast with a heavy driver)
 
-  // --- MOTOR 1 SETTINGS (Prismatic) ---
-  stepper1.setMaxSpeed(800);      
-  stepper1.setAcceleration(500);  
+  // --- MOTOR 1 SETTINGS (Prismatic) --- # SLOW! - max 50 RPM TODO
+  stepper1.setMaxSpeed(900);      
+  stepper1.setAcceleration(600);
 
   // --- MOTOR 2 SETTINGS (Shoulder) ---
   stepper2.setMaxSpeed(6000);     
@@ -140,8 +139,12 @@ void setup() {
   stepper3.setCurrentPosition(-THETA2_HOME_DEG * STEPS_PER_DEG); // Note that stepper 3 is positive clockwise
 
   // End-Effector config
-  ledcAttach(SERVO_PIN, 50, 14);  // pin, 50Hz, 16-bit resolution
-  writeServoUs(2000);   // fully open  (was gripperServo.write(55)) - EXTRA Start angle of 90 might need to be changed
+  ledcAttach(SERVO_PIN, 50, 14);  // pin, 50Hz, 14-bit resolution
+  // Fully Closed (0 degrees): 1000 microseconds
+  // Neutral / Middle (90 degrees): 1500 microseconds
+  // Fully Open (180 degrees): 2000 microseconds
+  writeServoUs(1056);   // start gripper fully closed to prevent collisions! (was gripperServo.write(5)) - TODO CHECK THIS WORKS
+
 
   // Start connection to the Camera (RX, TX)
   CameraSerial.setTimeout(20); 
@@ -194,9 +197,9 @@ void loop() { // no delays or while loops allowed!
 
     case STATE_PICKUP_DESCEND:
       // Wait for Z-axis to reach disc level
-      if (motorsIdle(true, false, false)) {
+      if (motorsIdle(true, false, false)) { // TODO MIGHT NEED THESE ALL TRUE
         // Z is down — now close the gripper
-        writeServoUs(2400);  // fully closed (was gripperServo.write(5)) #TODO
+        closeGripper();  // fully closed (was gripperServo.write(5)) #TODO
         stateTimer = millis(); // Start settle timer
         transitionTo(STATE_PICKUP_CLOSE);
       }
@@ -212,50 +215,51 @@ void loop() { // no delays or while loops allowed!
 
     case STATE_PICKUP_ASCEND:
       if (motorsIdle(true, false, false)) {
-        // Safely up — move arms to safe XY before travelling to dropoff
+        // move arms to safe XY before travelling to dropoff
         moveToPos(SAFE_XY_X, SAFE_XY_Y);
-        transitionTo(STATE_DELIVER_MOVE_DROP);
+        transitionTo(STATE_DELIVER_MOVE_SAFE_POS);
       }
       break;
   
-    case STATE_DELIVER_MOVE_DROP:
+    case STATE_DELIVER_MOVE_SAFE_POS:
       if (motorsIdle(false, true, true)) {
         stepper1.moveTo(Z_DROPOFF_HEIGHT); 
-        transitionTo(STATE_DELIVER_MOVE_SAFE);
+        transitionTo(STATE_DELIVER_DROPOFF_HEIGHT);
       }
       break;
 
-    case STATE_DELIVER_MOVE_SAFE:
-      if (motorsIdle(true, true, true)) {
-        transitionTo(STATE_DELIVER_DESCEND);
+    case STATE_DELIVER_DROPOFF_HEIGHT:
+      if (motorsIdle(true, false, false)) {
         moveToPos(DROPOFF_X, DROPOFF_Y); 
+        transitionTo(STATE_DELIVER_MOVE_DROPOFF_POS);
       }
       break;
 
-    case STATE_DELIVER_DESCEND:
-      if (motorsIdle(true, false, false)) {
-        writeServoUs(500);   // fully open  (was gripperServo.write(90))
-        stateTimer = millis();
-        transitionTo(STATE_DELIVER_OPEN);
-      }
-      break;
-
-    case STATE_DELIVER_OPEN:
-      if (millis() - stateTimer >= GRIPPER_SETTLE_MS) {
-        stepper1.moveTo(Z_TRAVEL_HEIGHT);
-        transitionTo(STATE_RETURN_ASCEND);
-      }
-      break;
-
-    case STATE_RETURN_ASCEND:         // wait for Z up
-      if (motorsIdle(true, false, false)) {
-        moveToPos(SAFE_XY_X, SAFE_XY_Y);  // retrace back through safe XY
-        transitionTo(STATE_RETURN_SAFE);   // new state
-      }
-      break;
-
-    case STATE_RETURN_SAFE:           // wait for safe XY, then go home
+    case STATE_DELIVER_MOVE_DROPOFF_POS:
       if (motorsIdle(false, true, true)) {
+        openGripper();   // fully open  (was gripperServo.write(90))
+        stateTimer = millis();
+        transitionTo(STATE_DELIVER_DROPOFF);
+      }
+      break;
+
+    case STATE_DELIVER_DROPOFF:
+      if (millis() - stateTimer >= GRIPPER_SETTLE_MS) {
+        moveToPos(SAFE_XY_X, SAFE_XY_Y);  // retrace back through safe XY
+        closeGripper();
+        transitionTo(STATE_RETURN_MOVE_SAFE);
+      }
+      break;
+
+    case STATE_RETURN_MOVE_SAFE:
+      if (motorsIdle(false, true, true)) {
+          stepper1.moveTo(Z_TRAVEL_HEIGHT);
+          transitionTo(STATE_RETURN_TRAVEL_HEIGHT);
+      }
+      break;
+
+    case STATE_RETURN_TRAVEL_HEIGHT:
+      if (motorsIdle(true, false, false)) {
         stepper2.moveTo(THETA1_HOME_DEG * STEPS_PER_DEG);
         stepper3.moveTo(-THETA2_HOME_DEG * STEPS_PER_DEG);
         transitionTo(STATE_RETURN_HOME);
@@ -264,9 +268,6 @@ void loop() { // no delays or while loops allowed!
 
     case STATE_RETURN_HOME:
       if (motorsIdle(false, true, true)) {
-        // Lower Z to observation height, then start looking for the next disc
-        stepper1.moveTo(Z_TRAVEL_HEIGHT);
-        // We don't wait for Z here — camera can start scanning straight away
         transitionTo(STATE_LOCATING_DISC);
       }
       break;
@@ -301,8 +302,11 @@ bool motorsIdle(bool checkZ, bool checkShoulder, bool checkElbow) {
 //  SERVO
 // =======================================================
 void writeServoUs(uint32_t microseconds) {
-  // Convert microseconds to a 14-bit duty cycle for a 50Hz signal
-  uint32_t dutyCycle = (microseconds * 65535) / 20000; 
+  // Convert microseconds to a 16-bit duty cycle for a 50Hz signal
+  // uint32_t dutyCycle = (microseconds * 65535) / 20000; 
+
+  // Convert microseconds to a 14-bit duty cycle for a 50Hz signal (20,000 us period) - Max 14-bit value is 16383
+  uint32_t dutyCycle = (microseconds * 16383) / 20000; // TODO - servo 14 bit change (check to see if servo opens)
   
   // Write the calculated duty cycle to the pin
   ledcWrite(SERVO_PIN, dutyCycle);
@@ -380,7 +384,7 @@ bool areValuesStable(float currentX, float currentY) { // there is a type mismat
 //  Gripper
 // =======================================================
 void closeGripper() {
-  writeServoUs(600);  // fully closed (was gripperServo.write(5))
+  writeServoUs(1027);  // fully closed (was gripperServo.write(5))
 }
 
 void openGripper() {
@@ -451,18 +455,20 @@ void homeRobot() { // EXTRA - this func might need additional configuration
   // Limit switch on LIMIT_PIN_XY is mounted onto the SCARA and is triggered by the elbow joint
 
   // --- Prismatic joint (stepper1) ---
-  stepper1.setSpeed(-300); // Adjust sign if it spins the wrong way
+  stepper1.setSpeed(-300);
   while (digitalRead(LIMIT_PIN_Z) == HIGH) {
     stepper1.runSpeed();
   }
   stepper1.stop();
   stepper1.setCurrentPosition(0); // Note that stepper 1 is positive up
-  stepper1.moveTo(Z_TRAVEL_HEIGHT);
+  // stepper1.moveTo(Z_TRAVEL_HEIGHT);
+  stepper1.runToNewPosition(Z_TRAVEL_HEIGHT); // stepper blocks until position is reached - TODO ENSURE THIS DOESN'T CAUSE ISSUES
+
 
   // --- Elbow and Shoulder revolute joints ---
   // Is it a good or bad idea to move elbow say 90deg clockwise to avoid failure in homing (collision).
-  stepper2.setSpeed(300); // Shoulder - Adjust sign if it spins the wrong way
-  stepper3.setSpeed(-140); // Elbow - Adjust sign if it spins the wrong way
+  stepper2.setSpeed(300); // Shoulder
+  stepper3.setSpeed(-140); // Elbow
   while (digitalRead(LIMIT_PIN_XY) == HIGH) {
     stepper2.runSpeed();
     stepper3.runSpeed();
