@@ -1,6 +1,10 @@
 # Torque_of_the_Town
 Mechatronics Group 1 Coursework 25WSC912
 
+ESP32S3 Code is located in ESP32S3_motor_control.ino
+XIAO ESP32S3 Sense Camera code is located in XIAO_CAM.ino
+
+
 2D_similarity_transform_maths.py is for working out 2D similarity transform constants and shouldn't need to be edited or used.
 
 detect_disc_location_from_world_frame is using the 2D similarity constants and the pixel locations of the corners of the red pickup boundry to work out where the disc is. It is uploaded to the main ESP32S3 and expects a pixel location for the centre of the disc from the camera (sent via the XIAO_CAM code). The output of this is a measurement in mm from the world frame as to the whereabouts of the white disc, however this was not outputting the correct values when I checked so will need some fixing.
