@@ -362,7 +362,7 @@ void calculateDiscLocation(float pixel_x, float pixel_y, float &world_x, float &
   world_y = (p2 * pixel_x) + (p1 * pixel_y) + ty;
 }
 
-bool areValuesStable(float currentX, float currentY) { // there is a type mismatch here but should be fine as truncating (rounding) to nearest mm will be fine
+bool areValuesStable(float currentX, float currentY) {
   static float lastX = 0.0;       // Stores the previous X value
   static float lastY = 0.0;       // Stores the previous Y value
   static int count = 0;       // Tracks consecutive matches for both
