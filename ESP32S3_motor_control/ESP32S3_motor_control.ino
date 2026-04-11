@@ -362,8 +362,8 @@ bool areValuesStable(float currentX, float currentY) { // there is a type mismat
   static float lastY = 0.0;       // Stores the previous Y value
   static int count = 0;       // Tracks consecutive matches for both
 
-  // Check if BOTH values are exactly the same as last time -  Use a small tolerance rather than exact equality for floats
-  if (fabs(currentX - lastX) < 1.0 && fabs(currentY - lastY) < 1.0) { // EXTRA - adjust if tolerance is too little
+  // Check if BOTH values are exactly the same as last time -  Use a small tolerance rather than exact equality for floats (within 3mm)
+  if (fabs(currentX - lastX) < 3.0 && fabs(currentY - lastY) < 3.0) { // EXTRA - adjust if tolerance is too little
     count++;
   } else {
     lastX = currentX;
