@@ -317,9 +317,14 @@ void writeServoUs(uint32_t microseconds) {
 // =======================================================
 void handleLocatingDisc() {
   if (!CameraSerial.available()) return; // EXTRA might be good to put a serial.print in this case
-    
-  // Read the text until the end of the line
-  String incomingData = CameraSerial.readStringUntil('\n'); // readStringUntil will stutter (and lose steps to) motors but should be fine as they shouldn't be moving for detection
+  
+  String incomingData = "";
+  
+  // Read and discard everything in the buffer until we get to the very last line
+  while (CameraSerial.available()) {
+    incomingData = CameraSerial.readStringUntil('\n'); 
+  }
+  
   incomingData.trim(); // Clean up any hidden spaces or carriage returns
   
   // Did the camera lose the disc?
