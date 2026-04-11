@@ -313,7 +313,7 @@ void writeServoUs(uint32_t microseconds) {
 }
 
 // =======================================================
-//  CAMERA
+//  CAMERA (XIAO ESP32S3 SENSE)
 // =======================================================
 void handleLocatingDisc() {
   if (!CameraSerial.available()) return; // EXTRA might be good to put a serial.print in this case
