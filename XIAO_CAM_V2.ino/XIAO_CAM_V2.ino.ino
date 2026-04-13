@@ -19,7 +19,7 @@ const int MIN_PIXELS = 50;
 const int MERGE_DISTANCE = 5; // Max gap (in pixels) between white pixels to be considered the same blob
 
 // Debug mode to see binary mask (black and white thresholding)
-const bool DEBUG_MASK_MODE = true;
+const bool DEBUG_MASK_MODE = false;
 
 // --- AXIS TRANSFORMATION TOGGLES ---
 const bool SWAP_XY_AXES = true;       // True: X becomes Y, Y becomes X

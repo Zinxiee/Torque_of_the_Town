@@ -59,25 +59,27 @@ RobotState currentState = STATE_IDLE;
 unsigned long stateTimer = 0;
 
 // ---- Calibration values (fill these in once tested) ----
-const long Z_DISC_LEVEL     =   0; // TODO - test reducing this slightly (gripper appears to be abt 2mm from the ground. needs to be touching)
+const long Z_DISC_LEVEL     =   0 + 100; // TODO - test reducing this slightly (gripper appears to be abt 2mm from the ground. needs to be touching)
 const long Z_TRAVEL_HEIGHT  = 2000;   // steps for Z safe travel height (~2cm from gnd)
-const long Z_DROPOFF_HEIGHT = 12200;   // steps for Z at dropoff height
+const long Z_DROPOFF_HEIGHT = 12100;   // steps for Z at dropoff height
+const long ELBOW_SAFETY = 100;
 
 const float SAFE_XY_X = -148.0;      // Intermediate safe XY position before dropoff
 const float SAFE_XY_Y =  190.0;
-float DROPOFF_X = 55;            // flipping station dropoff XY
-float DROPOFF_Y = 180;
+float DROPOFF_X = 48;    //50        // flipping station dropoff XY
+float DROPOFF_Y = 181;   //182
 
-const unsigned long GRIPPER_SETTLE_MS = 300; // Time to wait after closing/opening gripper // TODO - test this
+
+const unsigned long GRIPPER_SETTLE_MS = 600; // Time to wait after closing/opening gripper // TODO - test this
 
 // =======================================================
 //  CAMERA CALIBRATION PARAMETERS
 // from the python script
 // =======================================================
-float p1 = 0.907631; // k*cos(theta)
-float p2 = -0.017293; // k*sin(theta)
-float tx = -259.497903; // Translation X
-float ty = -140.493713; // Translation Y
+float p1 = 0.915922; // k*cos(theta)
+float p2 = 0.002437; // k*sin(theta)
+float tx = -257.191511; // Translation X
+float ty = -146.010561; // Translation Y
 
 // ==========================================
 //  ROBOT GEOMETRY & CONSTANTS
@@ -90,9 +92,9 @@ const float THETA2_HOME_DEG = 60.0; // elbow joint home angle (this was the caus
 // PHYSICAL JOINT LIMITS
 // These physical limits of your joints are defined so the IK knows what is impossible.
 const float THETA1_MIN_DEG = 90.0;     // Shoulder
-const float THETA1_MAX_DEG = 290.0;   // Shoulder
-const float THETA2_MIN_DEG = -140.0;  // Elbow maximum bend inwards (might need adjustment)
-const float THETA2_MAX_DEG = 140.0;   // Elbow maximum bend outwards (might need adjustment)
+const float THETA1_MAX_DEG = 295.0;   // Shoulder
+const float THETA2_MIN_DEG = -150.0;  // Elbow maximum bend inwards (might need adjustment) #TODO
+const float THETA2_MAX_DEG = 150.0;   // Elbow maximum bend outwards (might need adjustment) # TODO
 
 // Motor scaling (with 1.8deg motor, 8x microstepping (1600 pulse/rev), 4:1 gear ratio) - essentially 1600 * 4 / 360
 const float STEPS_PER_DEG = (200.0 * 8.0 * 4.0) / 360.0; 
@@ -123,16 +125,16 @@ void setup() {
   // if motors make a whining noise, reduce acceleration (stepper motors can stall if accelerated too fast with a heavy driver)
 
   // --- MOTOR 1 SETTINGS (Prismatic) --- # SLOW! - max 50 RPM TODO
-  stepper1.setMaxSpeed(900);      
-  stepper1.setAcceleration(600);
+  stepper1.setMaxSpeed(8000);      // 7000 works with 1000 accel
+  stepper1.setAcceleration(1000);
 
   // --- MOTOR 2 SETTINGS (Shoulder) ---
-  stepper2.setMaxSpeed(6000);     
-  stepper2.setAcceleration(1000);
+  stepper2.setMaxSpeed(12000);     // 6000
+  stepper2.setAcceleration(5000); //1200
 
   // --- MOTOR 3 SETTINGS (Elbow) ---
-  stepper3.setMaxSpeed(6000);     
-  stepper3.setAcceleration(1000);
+  stepper3.setMaxSpeed(12000);     // 6000
+  stepper3.setAcceleration(5000); //1200
 
   // Set initial home positions
   stepper2.setCurrentPosition(THETA1_HOME_DEG * STEPS_PER_DEG); // Note that stepper 2 is positive anticlockwise
@@ -143,7 +145,7 @@ void setup() {
   // Fully Closed (0 degrees): 1000 microseconds
   // Neutral / Middle (90 degrees): 1500 microseconds
   // Fully Open (180 degrees): 2000 microseconds
-  writeServoUs(1056);   // start gripper fully closed to prevent collisions! (was gripperServo.write(5)) - TODO CHECK THIS WORKS
+  writeServoUs(600);   // start gripper fully closed to prevent collisions! (was gripperServo.write(5)) - TODO CHECK THIS WORKS
 
 
   // Start connection to the Camera (RX, TX)
@@ -191,6 +193,7 @@ void loop() { // no delays or while loops allowed!
       if (motorsIdle(false, true, true)) {
         // Queue the Z descent
         stepper1.moveTo(Z_DISC_LEVEL);
+        openGripper();
         transitionTo(STATE_PICKUP_DESCEND);
       }
       break;
@@ -261,7 +264,9 @@ void loop() { // no delays or while loops allowed!
     case STATE_RETURN_TRAVEL_HEIGHT:
       if (motorsIdle(true, false, false)) {
         stepper2.moveTo(THETA1_HOME_DEG * STEPS_PER_DEG);
-        stepper3.moveTo(-THETA2_HOME_DEG * STEPS_PER_DEG);
+        stepper3.moveTo(-THETA2_HOME_DEG * STEPS_PER_DEG + ELBOW_SAFETY);
+        Serial.print("ELBOW HOME POS");
+        Serial.println(-THETA2_HOME_DEG * STEPS_PER_DEG);
         transitionTo(STATE_RETURN_HOME);
       }
       break;
@@ -389,11 +394,11 @@ bool areValuesStable(float currentX, float currentY) {
 //  Gripper
 // =======================================================
 void closeGripper() {
-  writeServoUs(1027);  // fully closed (was gripperServo.write(5))
+  writeServoUs(600);  // fully closed (was gripperServo.write(5))
 }
 
 void openGripper() {
-  writeServoUs(1500);   // fully open  (was gripperServo.write(90))
+  writeServoUs(1600);   // fully open  (was gripperServo.write(90))
 }
 
 
@@ -467,7 +472,7 @@ void homeRobot() { // EXTRA - this func might need additional configuration
   stepper1.stop();
   stepper1.setCurrentPosition(0); // Note that stepper 1 is positive up
   // stepper1.moveTo(Z_TRAVEL_HEIGHT);
-  stepper1.runToNewPosition(Z_TRAVEL_HEIGHT); // stepper blocks until position is reached - TODO ENSURE THIS DOESN'T CAUSE ISSUES
+  stepper1.runToNewPosition(Z_TRAVEL_HEIGHT);
 
 
   // --- Elbow and Shoulder revolute joints ---
@@ -483,6 +488,7 @@ void homeRobot() { // EXTRA - this func might need additional configuration
 
   stepper2.setCurrentPosition(THETA1_HOME_DEG * STEPS_PER_DEG); // Note that stepper 2 is positive anticlockwise
   stepper3.setCurrentPosition(-THETA2_HOME_DEG * STEPS_PER_DEG); // Note that stepper 3 is positive clockwise
+  stepper3.runToNewPosition(ELBOW_SAFETY);
 
   Serial.println("Homing Complete. Torquey is operational!");
   transitionTo(STATE_LOCATING_DISC);
