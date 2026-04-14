@@ -66,7 +66,7 @@ const long ELBOW_SAFETY = 100;
 
 const float SAFE_XY_X = -148.0;      // Intermediate safe XY position before dropoff
 const float SAFE_XY_Y =  190.0;
-float DROPOFF_X = 48;    //50        // flipping station dropoff XY
+float DROPOFF_X = 46;    //50        // flipping station dropoff XY
 float DROPOFF_Y = 181;   //182
 
 
@@ -125,7 +125,7 @@ void setup() {
   // if motors make a whining noise, reduce acceleration (stepper motors can stall if accelerated too fast with a heavy driver)
 
   // --- MOTOR 1 SETTINGS (Prismatic) --- # SLOW! - max 50 RPM TODO
-  stepper1.setMaxSpeed(8000);      // 7000 works with 1000 accel
+  stepper1.setMaxSpeed(16000);      // 8000 works with 1000 accel
   stepper1.setAcceleration(1000);
 
   // --- MOTOR 2 SETTINGS (Shoulder) ---
@@ -273,6 +273,7 @@ void loop() { // no delays or while loops allowed!
 
     case STATE_RETURN_HOME:
       if (motorsIdle(false, true, true)) {
+        zHome();
         transitionTo(STATE_LOCATING_DISC);
       }
       break;
@@ -460,12 +461,25 @@ bool checkLimits(float t1, float t2) {
   return (t1 >= THETA1_MIN_DEG && t1 <= THETA1_MAX_DEG && t2 >= THETA2_MIN_DEG && t2 <= THETA2_MAX_DEG);
 }
 
+void zHome() {
+    // --- Prismatic joint (stepper1) ---
+  stepper1.setSpeed(-600);
+  while (digitalRead(LIMIT_PIN_Z) == HIGH) {
+    stepper1.runSpeed();
+  }
+  stepper1.stop();
+  stepper1.setCurrentPosition(0); // Note that stepper 1 is positive up
+  // stepper1.moveTo(Z_TRAVEL_HEIGHT);
+  stepper1.runToNewPosition(Z_TRAVEL_HEIGHT);
+  Serial.println("Z Home!");
+}
+
 void homeRobot() { // EXTRA - this func might need additional configuration
   // Limit switch on LIMIT_PIN_Z is on the Z axis for prismatic joint
   // Limit switch on LIMIT_PIN_XY is mounted onto the SCARA and is triggered by the elbow joint
 
   // --- Prismatic joint (stepper1) ---
-  stepper1.setSpeed(-300);
+  stepper1.setSpeed(-600);
   while (digitalRead(LIMIT_PIN_Z) == HIGH) {
     stepper1.runSpeed();
   }
