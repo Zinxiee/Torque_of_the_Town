@@ -442,7 +442,7 @@ void moveToPos(float x, float y) {
     final_t1 = t1_deg_B; final_t2 = t2_deg_B;
   } else {
     Serial.println("CRITICAL WARNING: BOTH JOINT LIMITS HIT - IK IS UNSOLVABLE");
-    return;
+    transitionTo(STATE_LOCATING_DISC);
   }
 
   // Convert degrees to stepper motor steps
