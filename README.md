@@ -1,11 +1,17 @@
 # Torque_of_the_Town
 Mechatronics Group 1 Coursework 25WSC912
 
+## Video Demos:
+### Torquey - Single-Disc collection Demo:
+
 [![Torquey - Single-Disc collection Demo](https://img.youtube.com/vi/3hX0Q1lNYFE/0.jpg)](https://www.youtube.com/watch?v=3hX0Q1lNYFE)
+
+
+### Torquey - Multi-Disc collection Demo:
 
 [![Torquey - Multi-Disc collection Demo](https://img.youtube.com/vi/oQwFLpYt4kk/0.jpg)](https://www.youtube.com/watch?v=oQwFLpYt4kk)
 
-MAIN FILES:
+## MAIN FILES:
 ESP32S3 Code is located in ESP32S3_motor_control.ino
 XIAO ESP32S3 Sense Camera code is located in XIAO_CAM_V2.ino
 (apologies for the state of the repository)
